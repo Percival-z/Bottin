@@ -238,7 +238,7 @@ def main() -> None:
     # Construir la aplicación de Telegram
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Registrar handlers
+    ## Registrar handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
