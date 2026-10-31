@@ -28,7 +28,7 @@ system_instruction = (
     "con datos, análisis y comentarios deportivos. Sin embargo no abrumes con informacion y limitate a responder con lo que te piden. No comentes nada ademas de eso"
 )
 
-# Inicializar el modelo Gemini 1.5 Flash con sus instrucciones de sistema
+# Inicializar el modelo Gemini con sus instrucciones de sistema
 model = genai.GenerativeModel(
     model_name="gemini-3.1-flash-lite",
     generation_config=generation_config,
@@ -77,8 +77,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Responde al comando /start con un saludo personalizado."""
     nombre = update.effective_user.first_name
     await update.message.reply_text(
-        f"¡Hola, {nombre}! ⚽ Soy **BotTin**, tu asistente de fútbol potenciado con Inteligencia Artificial. "
-        f"Ya tengo memoria en SQLite y estoy listo para debatir de fútbol. Escribí /help para más info."
+        f"¡Hola, {nombre}! ⚽ Soy BotTin, tu asistente de fútbol potenciado con Inteligencia Artificial. "
+        f"Escribí /help para más info."
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
