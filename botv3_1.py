@@ -6,11 +6,13 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import google.generativeai as genai
+import requests
 
 # Cargar las variables de entorno desde el archivo .env
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
 # Configurar la API de Gemini
 genai.configure(api_key=GEMINI_API_KEY)
@@ -108,8 +110,74 @@ def get_chat_history(chat_id: int):
         })
     return history
 
+def obtener_partidos_hoy() -> str:
+    """Consulta los partidos del día en API-Football con logs de diagnóstico."""
+    if not FOOTBALL_API_KEY:
+        print("❌ ERROR: FOOTBALL_API_KEY no está configurada o está vacía en el .env")
+        return ""
+    
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    url = "https://v3.football.api-sports.io/fixtures"
+    querystring = {"date": hoy}
+    headers = {
+        'x-apisports-key': FOOTBALL_API_KEY
+    }
+    
+    print(f"🔍 Consultando API-Football para la fecha: {hoy}...")
+    
+    try:
+        response = requests.get(url, headers=headers, params=querystring, timeout=10)
+        print(f"📡 Código de estado HTTP de la API: {response.status_code}")
+        
+        data = response.json()
+        
+        # Imprimir errores que devuelva la API misma (ej. clave inválida, límite superado)
+        if "errors" in data and data["errors"]:
+            print(f"⚠️ Errores devueltos por la API: {data['errors']}")
+            
+        matches = data.get("response", [])
+        print(f"⚽ Total de partidos devueltos por la API para hoy: {len(matches)}")
+        
+        if not matches:
+            return "No hay partidos programados para hoy según la API."
+            
+        ligas_permitidas = [128, 39, 140, 135, 78, 61]
+        resumen = []
+        
+        for m in matches:
+            league_id = m["league"]["id"]
+            if league_id in ligas_permitidas:
+                liga = m["league"]["name"]
+                local = m["teams"]["home"]["name"]
+                visita = m["teams"]["away"]["name"]
+                goles_home = m["goals"]["home"]
+                goles_away = m["goals"]["away"]
+                estado = m["fixture"]["status"]["short"]
+                
+                if estado in ["FT", "AET", "PEN"]:
+                    marcador = f"{goles_home} - {goles_away} (Finalizado)"
+                elif estado in ["1H", "2H", "HT", "ET"]:
+                    marcador = f"{goles_home} - {goles_away} ¡En juego!"
+                else:
+                    hora_utc = m["fixture"]["date"].split("T")[1][:5]
+                    marcador = f"A las {hora_utc} UTC"
+                    
+                resumen.append(f"- [{liga}] {local} vs {visita} -> {marcador}")
+                
+        if not resumen:
+            print("ℹ️ Hubo partidos hoy, pero ninguno coincidió con las 5 grandes ligas ni la liga argentina.")
+            return "Hay partidos hoy, pero no en las ligas configuradas."
+            
+        print(f"✅ Se filtraron {len(resumen)} partidos de las ligas de interés.")
+        return "\n".join(resumen[:12])
+        
+    except Exception as e:
+        print(f"❌ Excepción crítica al conectar con API-Football: {e}")
+        return "No se pudo consultar el fixture en este momento."
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Procesa los mensajes usando el historial de SQLite y contexto temporal exacto en español."""
+    """Procesa los mensajes usando el historial de SQLite, contexto temporal exacto y datos de la API de fútbol."""
     chat_id = update.effective_chat.id
     user_text = update.message.text
     
@@ -126,22 +194,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         nombre_mes = meses[now.month]
         ahora_formateada = f"{nombre_dia} {now.day} de {nombre_mes} de {now.year} a las {now.strftime('%H:%M')}"
         
-        # 3. Construir el prompt inyectando el contexto temporal indiscutible
+        # 3. Consultar la API si el usuario menciona palabras clave relacionadas con partidos
+        info_partidos = ""
+        palabras_clave = ["partido", "partidos", "juega", "hoy", "resultado", "fecha", "tabla", "equipo", "vs", "river", "boca"]
+        if any(palabra in user_text.lower() for palabra in palabras_clave):
+            datos_api = obtener_partidos_hoy()
+            if datos_api:
+                info_partidos = f"\n[Datos oficiales de partidos para hoy]:\n{datos_api}\n"
+
+        # 4. Construir el prompt inyectando el contexto temporal y los datos reales
         prompt_con_contexto = (
             f"[Contexto del sistema: Hoy es estrictamente {ahora_formateada}]. "
+            f"{info_partidos}"
             f"Mensaje del usuario: {user_text}"
         )
         
-        # 4. Iniciar el chat de Gemini con el historial y el contexto
+        # 5. Iniciar el chat de Gemini con el historial y el contexto
         chat = model.start_chat(history=history)
         response = chat.send_message(prompt_con_contexto)
         bot_reply = response.text
         
-        # 5. Guardar en SQLite
+        # 6. Guardar la interacción en SQLite
         save_message(chat_id, "user", user_text)
         save_message(chat_id, "model", bot_reply)
         
-        # 6. Enviar respuesta en Telegram
+        # 7. Enviar la respuesta en Telegram
         await update.message.reply_text(bot_reply)
         
     except Exception as e:
