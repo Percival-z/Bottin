@@ -17,18 +17,18 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 # Configuración del modelo con un System Prompt enfocado en fútbol
 generation_config = {
-    "temperature": 0.7,
+    "temperature": 0.6,
 }
 
 system_instruction = (
     "Sos BotTin, un asistente virtual experto, apasionado y dinámico especializado en fútbol. "
     "Respondés de forma cercana, amigable y directa a los hinchas y usuarios, ayudándoles "
-    "con datos, análisis y comentarios deportivos."
+    "con datos, análisis y comentarios deportivos. Sin embargo no abrumes con informacion y limitate a responder con lo que te piden. No comentes nada ademas de eso"
 )
 
 # Inicializar el modelo Gemini 1.5 Flash con sus instrucciones de sistema
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-3.1-flash-lite",
     generation_config=generation_config,
     system_instruction=system_instruction
 )
@@ -87,30 +87,67 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Guardo el historial de nuestra charla de forma local."
     )
 
+def get_chat_history(chat_id: int):
+    """Recupera el historial de mensajes de un chat específico desde SQLite 
+    y lo formatea para que Gemini lo entienda."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id ASC",
+        (chat_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    
+    history = []
+    for role, content in rows:
+        # La API de Gemini espera el formato de roles: 'user' o 'model'
+        history.append({
+            "role": role,
+            "parts": [content]
+        })
+    return history
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Procesa los mensajes de texto del usuario usando Gemini y guardando en SQLite."""
+    """Procesa los mensajes usando el historial de SQLite y contexto temporal exacto en español."""
     chat_id = update.effective_chat.id
     user_text = update.message.text
     
-    # 1. Guardar el mensaje del usuario en la base de datos
-    save_message(chat_id, "user", user_text)
-    
     try:
-        # 2. Iniciar chat con Gemini (puedes enviar el mensaje directamente)
-        chat = model.start_chat(history=[])
-        response = chat.send_message(user_text)
+        # 1. Recuperar el historial previo de SQLite
+        history = get_chat_history(chat_id)
+        
+        # 2. Diccionarios para garantizar el día y mes exacto en español
+        dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+        meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        
+        now = datetime.now()
+        nombre_dia = dias[now.weekday()]
+        nombre_mes = meses[now.month]
+        ahora_formateada = f"{nombre_dia} {now.day} de {nombre_mes} de {now.year} a las {now.strftime('%H:%M')}"
+        
+        # 3. Construir el prompt inyectando el contexto temporal indiscutible
+        prompt_con_contexto = (
+            f"[Contexto del sistema: Hoy es estrictamente {ahora_formateada}]. "
+            f"Mensaje del usuario: {user_text}"
+        )
+        
+        # 4. Iniciar el chat de Gemini con el historial y el contexto
+        chat = model.start_chat(history=history)
+        response = chat.send_message(prompt_con_contexto)
         bot_reply = response.text
         
-        # 3. Guardar la respuesta del modelo en la base de datos
+        # 5. Guardar en SQLite
+        save_message(chat_id, "user", user_text)
         save_message(chat_id, "model", bot_reply)
         
-        # 4. Enviar la respuesta al usuario en Telegram
+        # 6. Enviar respuesta en Telegram
         await update.message.reply_text(bot_reply)
         
     except Exception as e:
-        logger.error(f"Error al conectar con Gemini: {e}")
+        logger.error(f"Error al procesar el mensaje con Gemini: {e}")
         await update.message.reply_text(
-            "⚠️ Tuve un problema técnico conectando con la IA de Gemini. Intentá de nuevo en un momento."
+            "⚠️ Tuve un problema técnico procesando tu mensaje. Intentá de nuevo en un momento."
         )
 
 def main() -> None:
