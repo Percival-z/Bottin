@@ -7,6 +7,9 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import google.generativeai as genai
 import requests
+from PIL import Image
+import io
+from pypdf import PdfReader
 
 # Cargar las variables de entorno desde el archivo .env
 load_dotenv()
@@ -65,13 +68,69 @@ def save_message(chat_id: int, role: str, content: str):
     conn.commit()
     conn.close()
 
+def init_stats_db():
+    """Crea una tabla para estadísticas históricas si no existe."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS team_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team TEXT,
+            opponent TEXT,
+            result TEXT, -- 'G' (Ganado), 'E' (Empatado), 'P' (Perdido)
+            goals_for INTEGER,
+            goals_against INTEGER,
+            date TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def analizar_racha_equipo(nombre_equipo: str) -> str:
+    """Consulta SQLite, calcula estadísticas recientes y genera un informe de racha."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT result, goals_for, goals_against, opponent, date 
+        FROM team_matches 
+        WHERE team LIKE ? 
+        ORDER BY id DESC LIMIT 5
+    ''', (f"%{nombre_equipo}%",))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        return f"No encontré registros históricos recientes en la base de datos local para el equipo '{nombre_equipo}'."
+    
+    total_partidos = len(rows)
+    ganados = sum(1 for r in rows if r[0] == 'G')
+    empatados = sum(1 for r in rows if r[0] == 'E')
+    perdidos = sum(1 for r in rows if r[0] == 'P')
+    goles_favor = sum(r[1] for r in rows)
+    goles_contra = sum(r[2] for r in rows)
+    
+    porcentaje_victorias = (ganados / total_partidos) * 100
+    
+    informe = (
+        f"📊 **Informe Estadístico y de Racha ({nombre_equipo.upper()})**:\n"
+        f"- Partidos analizados: {total_partidos}\n"
+        f"- Victorias: {ganados} | Empates: {empatados} | Derrotas: {perdidos}\n"
+        f"- Efectividad de victorias: {porcentaje_victorias:.1f}%\n"
+        f"- Goles a favor: {goles_favor} | Goles en contra: {goles_contra}\n"
+        f"- Diferencia de gol: {goles_favor - goles_contra}\n"
+    )
+    return informe
+
 # --- CONFIGURACIÓN DE LOGS ---
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- HANDLERS ---
+# --- HANDLERS Y FUNCIONES AUXILIARES ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Responde al comando /start con un saludo personalizado."""
@@ -84,14 +143,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Responde al comando /help."""
     await update.message.reply_text(
-        "🤖 **BotTin v3 (Gemini + SQLite)**\n"
-        "Podés preguntarme sobre tácticas, historia del fútbol, opiniones de equipos o planteles. "
-        "Guardo el historial de nuestra charla de forma local."
+        "🤖 **BotTin v4 (Gemini + SQLite + RAG + API)**\n"
+        "Podés preguntarme sobre partidos de hoy, estadísticas, reglamentos o enviarme imágenes de formaciones."
     )
 
 def get_chat_history(chat_id: int):
-    """Recupera el historial de mensajes de un chat específico desde SQLite 
-    y lo formatea para que Gemini lo entienda."""
+    """Recupera el historial de mensajes de un chat específico desde SQLite."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
@@ -103,7 +160,6 @@ def get_chat_history(chat_id: int):
     
     history = []
     for role, content in rows:
-        # La API de Gemini espera el formato de roles: 'user' o 'model'
         history.append({
             "role": role,
             "parts": [content]
@@ -131,7 +187,6 @@ def obtener_partidos_hoy() -> str:
         
         data = response.json()
         
-        # Imprimir errores que devuelva la API misma (ej. clave inválida, límite superado)
         if "errors" in data and data["errors"]:
             print(f"⚠️ Errores devueltos por la API: {data['errors']}")
             
@@ -175,76 +230,127 @@ def obtener_partidos_hoy() -> str:
         print(f"❌ Excepción crítica al conectar con API-Football: {e}")
         return "No se pudo consultar el fixture en este momento."
 
+def buscar_en_pdfs(query: str) -> str:
+    """Busca fragmentos relevantes dentro de los PDFs en la carpeta 'docs/'."""
+    docs_dir = "docs"
+    if not os.path.exists(docs_dir):
+        return ""
+    
+    contexto_encontrado = ""
+    palabras_clave = [p.lower() for p in query.split() if len(p) > 3]
+    
+    for filename in os.listdir(docs_dir):
+        if filename.endswith(".pdf"):
+            path = os.path.join(docs_dir, filename)
+            try:
+                reader = PdfReader(path)
+                for i, page in enumerate(reader.pages):
+                    texto = page.extract_text()
+                    if texto:
+                        if any(palabra in texto.lower() for palabra in palabras_clave):
+                            contexto_encontrado += f"\n[Fuente: {filename} - Pág {i+1}]:\n{texto[:1000]}...\n"
+            except Exception as e:
+                logger.error(f"Error leyendo PDF {filename}: {e}")
+                
+    return contexto_encontrado
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Procesa los mensajes usando el historial de SQLite, contexto temporal exacto y datos de la API de fútbol."""
     chat_id = update.effective_chat.id
     user_text = update.message.text
     
     try:
-        # 1. Recuperar el historial previo de SQLite
         history = get_chat_history(chat_id)
         
-        # 2. Diccionarios para garantizar el día y mes exacto en español
-        dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
-        meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-        
-        now = datetime.now()
-        nombre_dia = dias[now.weekday()]
-        nombre_mes = meses[now.month]
-        ahora_formateada = f"{nombre_dia} {now.day} de {nombre_mes} de {now.year} a las {now.strftime('%H:%M')}"
-        
-        # 3. Consultar la API si el usuario menciona palabras clave relacionadas con partidos
+        # 1. API: Consultar partidos en tiempo real si menciona palabras clave
         info_partidos = ""
-        palabras_clave = ["partido", "partidos", "juega", "hoy", "resultado", "fecha", "tabla", "equipo", "vs", "river", "boca"]
-        if any(palabra in user_text.lower() for palabra in palabras_clave):
+        palabras_clave_api = ["partido", "juega", "hoy", "resultado", "fecha", "tabla", "equipo", "vs", "partidos", "river", "boca"]
+        if any(palabra in user_text.lower() for palabra in palabras_clave_api):
             datos_api = obtener_partidos_hoy()
             if datos_api:
                 info_partidos = f"\n[Datos oficiales de partidos para hoy]:\n{datos_api}\n"
 
-        # 4. Construir el prompt inyectando el contexto temporal y los datos reales
+        # 2. RAG: Buscar en PDFs si pregunta por reglamentos o historia
+        info_rag = ""
+        if any(w in user_text.lower() for w in ["reglamento", "articulo", "ley", "historia", "fundacion", "torneo", "formato"]):
+            info_rag = buscar_en_pdfs(user_text)
+            if info_rag:
+                info_rag = f"\n[Información extraída de documentos oficiales/reglamentos]:\n{info_rag}\n"
+
+        # 3. Análisis de Estadísticas si nombra a un equipo pidiendo racha o rendimiento
+        info_stats = ""
+        if any(w in user_text.lower() for w in ["racha", "estadistica", "rendimiento", "ultimos partidos"]):
+            palabras = user_text.split()
+            equipo_buscado = palabras[-1] if palabras else ""
+            if equipo_buscado:
+                info_stats = f"\n{analizar_racha_equipo(equipo_buscado)}\n"
+
+        # 4. Contexto temporal en español
+        dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+        meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        now = datetime.now()
+        ahora_formateada = f"{dias[now.weekday()]} {now.day} de {meses[now.month]} de {now.year} a las {now.strftime('%H:%M')}"
+        
         prompt_con_contexto = (
             f"[Contexto del sistema: Hoy es estrictamente {ahora_formateada}]. "
             f"{info_partidos}"
+            f"{info_rag}"
+            f"{info_stats}"
             f"Mensaje del usuario: {user_text}"
         )
         
-        # 5. Iniciar el chat de Gemini con el historial y el contexto
         chat = model.start_chat(history=history)
         response = chat.send_message(prompt_con_contexto)
         bot_reply = response.text
         
-        # 6. Guardar la interacción en SQLite
         save_message(chat_id, "user", user_text)
         save_message(chat_id, "model", bot_reply)
         
-        # 7. Enviar la respuesta en Telegram
         await update.message.reply_text(bot_reply)
         
     except Exception as e:
-        logger.error(f"Error al procesar el mensaje con Gemini: {e}")
-        await update.message.reply_text(
-            "⚠️ Tuve un problema técnico procesando tu mensaje. Intentá de nuevo en un momento."
-        )
+        logger.error(f"Error procesando mensaje: {e}")
+        await update.message.reply_text("⚠️ Tuve un problema técnico procesando tu mensaje.")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Maneja imágenes enviadas por el usuario (formaciones, tablas, etc.) y las analiza con Gemini."""
+    chat_id = update.effective_chat.id
+    
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        image = Image.open(io.BytesIO(photo_bytes))
+        
+        user_caption = update.message.caption or "Analizá esta imagen de fútbol (formación, tabla o competición) y dame un resumen detallado."
+        
+        chat = model.start_chat(history=[])
+        response = chat.send_message([image, user_caption])
+        bot_reply = response.text
+        
+        save_message(chat_id, "user", f"[Imagen enviada]: {user_caption}")
+        save_message(chat_id, "model", bot_reply)
+        
+        await update.message.reply_text(bot_reply)
+        
+    except Exception as e:
+        logger.error(f"Error procesando imagen: {e}")
+        await update.message.reply_text("⚠️ Tuve un problema procesando la imagen. Intentá enviarla nuevamente.")
 
 def main() -> None:
-    """Función principal para poner en marcha el bot."""
-    # Inicializar base de datos
     init_db()
-
+    init_stats_db()
+    
     if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-        raise ValueError("Faltan credenciales en el archivo .env (TELEGRAM_TOKEN o GEMINI_API_KEY).")
+        raise ValueError("Faltan credenciales en el archivo .env")
 
-    # Construir la aplicación de Telegram
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    ## Registrar handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Iniciar Polling
-    print("BotTin v3 (Gemini + SQLite) está andando... Presioná Ctrl+C para detenerlo.")
+    print("BotTin v4 con RAG, Estadísticas, API en tiempo real y Multimodalidad funcionando...")
     app.run_polling()
 
 if __name__ == "__main__":
