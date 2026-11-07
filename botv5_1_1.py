@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import google.generativeai as genai
 import requests
+from bs4 import BeautifulSoup
 from PIL import Image
 import io
 from pypdf import PdfReader
@@ -20,25 +21,27 @@ FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 # Configurar la API de Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Configuración del modelo con un System Prompt enfocado en fútbol
+# Configuración del modelo con System Prompt ajustado y restricción temporal estricta (Año 2026)
 generation_config = {
-    "temperature": 0.6,
+    "temperature": 0.7,
 }
 
 system_instruction = (
     "Sos BotTin, un asistente virtual experto, apasionado y dinámico especializado en fútbol. "
-    "Respondés de forma cercana, amigable y directa a los hinchas y usuarios, ayudándoles "
-    "con datos, análisis y comentarios deportivos. Sin embargo no abrumes con informacion y limitate a responder con lo que te piden. No comentes nada ademas de eso"
+    "REGLA TEMPORAL ABSOLUTA: Te encuentras estrictamente en el año 2026. Bajo ninguna circunstancia debes hablar de partidos, "
+    "torneos o temporadas pasadas (como 2024 o 2025) cuando el usuario pregunte por la actualidad o el día de hoy. "
+    "Si los datos provistos en el contexto tienen fecha de hoy, cíñete estrictamente a ellos. "
+    "REGLA ESTRICTA: Nunca arranques tus respuestas saludando con '¡Hola!' o fórmulas de cortesía repetitivas a menos que el usuario te salude explícitamente en su mensaje actual. "
+    "Andá siempre directo al grano con lo que te piden, sin saludos automáticos ni introducciones de relleno."
 )
 
-# Inicializar el modelo Gemini con sus instrucciones de sistema
 model = genai.GenerativeModel(
-    model_name="gemini-3.1-flash-lite",
+    model_name="gemini-3.8-flash",
     generation_config=generation_config,
     system_instruction=system_instruction
 )
 
-# --- CONFIGURACIÓN DE SQLITE (HISTORIAL PERSISTENTE) ---
+# --- CONFIGURACIÓN DE SQLITE ---
 DB_NAME = "bottin_history.db"
 
 def init_db():
@@ -119,7 +122,6 @@ def analizar_racha_equipo(nombre_equipo: str) -> str:
         f"- Victorias: {ganados} | Empates: {empatados} | Derrotas: {perdidos}\n"
         f"- Efectividad de victorias: {porcentaje_victorias:.1f}%\n"
         f"- Goles a favor: {goles_favor} | Goles en contra: {goles_contra}\n"
-        f"- Diferencia de gol: {goles_favor - goles_contra}\n"
     )
     return informe
 
@@ -130,78 +132,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- HANDLERS Y FUNCIONES AUXILIARES ---
+# --- ESTRATEGIA HÍBRIDA DE DATOS (API-FOOTBALL + CHAMPIONS + PROMIEDOS) ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Responde al comando /start con un saludo personalizado."""
-    nombre = update.effective_user.first_name
-    await update.message.reply_text(
-        f"¡Hola, {nombre}! ⚽ Soy BotTin, tu asistente de fútbol potenciado con Inteligencia Artificial. "
-        f"Escribí /help para más info."
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Responde al comando /help."""
-    await update.message.reply_text(
-        "🤖 **BotTin v4 (Gemini + SQLite + RAG + API)**\n"
-        "Podés preguntarme sobre partidos de hoy, estadísticas, reglamentos o enviarme imágenes de formaciones."
-    )
-
-def get_chat_history(chat_id: int):
-    """Recupera el historial de mensajes de un chat específico desde SQLite."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id ASC",
-        (chat_id,)
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    
-    history = []
-    for role, content in rows:
-        history.append({
-            "role": role,
-            "parts": [content]
-        })
-    return history
-
-def obtener_partidos_hoy() -> str:
-    """Consulta los partidos del día en API-Football con logs de diagnóstico."""
+def obtener_partidos_api() -> str:
+    """Consulta los partidos del día en API-Football para Champions League y grandes ligas europeas."""
     if not FOOTBALL_API_KEY:
-        print("❌ ERROR: FOOTBALL_API_KEY no está configurada o está vacía en el .env")
         return ""
     
     hoy = datetime.now().strftime("%Y-%m-%d")
     url = "https://v3.football.api-sports.io/fixtures"
     querystring = {"date": hoy}
-    headers = {
-        'x-apisports-key': FOOTBALL_API_KEY
-    }
-    
-    print(f"🔍 Consultando API-Football para la fecha: {hoy}...")
+    headers = {'x-apisports-key': FOOTBALL_API_KEY}
     
     try:
         response = requests.get(url, headers=headers, params=querystring, timeout=10)
-        print(f"📡 Código de estado HTTP de la API: {response.status_code}")
-        
         data = response.json()
-        
-        if "errors" in data and data["errors"]:
-            print(f"⚠️ Errores devueltos por la API: {data['errors']}")
-            
         matches = data.get("response", [])
-        print(f"⚽ Total de partidos devueltos por la API para hoy: {len(matches)}")
         
         if not matches:
-            return "No hay partidos programados para hoy según la API."
+            return ""
             
-        ligas_permitidas = [128, 39, 140, 135, 78, 61]
+        # IDs permitidos: Champions League (2), Premier League (39), La Liga (140), Serie A (135), Bundesliga (78), Ligue 1 (61)
+        ligas_permitidas = [2, 39, 140, 135, 78, 61] 
         resumen = []
         
         for m in matches:
-            league_id = m["league"]["id"]
-            if league_id in ligas_permitidas:
+            if m["league"]["id"] in ligas_permitidas:
                 liga = m["league"]["name"]
                 local = m["teams"]["home"]["name"]
                 visita = m["teams"]["away"]["name"]
@@ -219,16 +175,76 @@ def obtener_partidos_hoy() -> str:
                     
                 resumen.append(f"- [{liga}] {local} vs {visita} -> {marcador}")
                 
-        if not resumen:
-            print("ℹ️ Hubo partidos hoy, pero ninguno coincidió con las 5 grandes ligas ni la liga argentina.")
-            return "Hay partidos hoy, pero no en las ligas configuradas."
-            
-        print(f"✅ Se filtraron {len(resumen)} partidos de las ligas de interés.")
-        return "\n".join(resumen[:12])
-        
+        return "\n".join(resumen[:15]) if resumen else ""
     except Exception as e:
-        print(f"❌ Excepción crítica al conectar con API-Football: {e}")
-        return "No se pudo consultar el fixture en este momento."
+        print(f"❌ Error al consultar API-Football: {e}")
+        return ""
+
+def obtener_partidos_promiedos() -> str:
+    """Extrae los partidos y resultados del día haciendo web scraping a Promiedos."""
+    url = "https://www.promiedos.com.ar/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return ""
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        resumen = []
+        
+        partidos = soup.find_all('tr', class_='promrow') or soup.find_all('div', class_='partido')
+        
+        if not partidos:
+            tablas = soup.find_all('table')
+            for tabla in tablas:
+                for fila in tabla.find_all('tr'):
+                    texto = fila.get_text(separator=" ", strip=True)
+                    if texto and ("-" in texto or ":" in texto) and len(texto) < 80:
+                        resumen.append(f"- {texto}")
+        else:
+            for p in partidos:
+                resumen.append(f"- {p.get_text(separator=' ', strip=True)}")
+                
+        return "\n".join(resumen[:15]) if resumen else ""
+    except Exception as e:
+        print(f"❌ Error haciendo scraping en Promiedos: {e}")
+        return ""
+
+def obtener_partidos_inteligente(user_text: str) -> str:
+    """Enrutador inteligente con inyección explícita de la fecha actual y Champions League."""
+    hoy_str = datetime.now().strftime("%Y-%m-%d")
+    
+    keywords_argentina = ["argentina", "liga profesional", "copa argentina", "river", "boca", "racing", "independiente", "san lorenzo", "godoy cruz", "talleres", "ascenso", "b nacional"]
+    es_futbol_argentino = any(k in user_text.lower() for k in keywords_argentina)
+    
+    datos_crudos = ""
+    fuente = ""
+    
+    if es_futbol_argentino or not FOOTBALL_API_KEY:
+        datos_crudos = obtener_partidos_promiedos()
+        fuente = "Promiedos"
+    else:
+        datos_crudos = obtener_partidos_api()
+        fuente = "API-Football (Champions y Ligas Top)"
+        if not datos_crudos:
+            datos_crudos = obtener_partidos_promiedos()
+            fuente = "Promiedos (Respaldo)"
+            
+    if not datos_crudos:
+        return f"[Aviso temporal: Hoy es {hoy_str} y no se encontraron partidos registrados en las fuentes para esta fecha]."
+        
+    return (
+        f"[INFORMACIÓN OBLIGATORIA EN TIEMPO REAL]\n"
+        f"- Fecha actual exacta del sistema: {hoy_str}\n"
+        f"- Fuente de datos: {fuente}\n"
+        f"- Partidos obtenidos:\n{datos_crudos}"
+    )
+
+# --- RAG CON PDFS ---
 
 def buscar_en_pdfs(query: str) -> str:
     """Busca fragmentos relevantes dentro de los PDFs en la carpeta 'docs/'."""
@@ -254,6 +270,38 @@ def buscar_en_pdfs(query: str) -> str:
                 
     return contexto_encontrado
 
+# --- HANDLERS DE TELEGRAM ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    nombre = update.effective_user.first_name
+    await update.message.reply_text(
+        f"¡Hola, {nombre}! ⚽ Soy BotTin v5_1_1, tu asistente con Champions League, Promiedos, estadísticas y RAG."
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🤖 **BotTin v5_1_1**\n"
+        "Podés preguntarme por partidos de hoy (Champions, ligas europeas o fútbol argentino), estadísticas, reglamentos o enviarme imágenes."
+    )
+
+def get_chat_history(chat_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id ASC",
+        (chat_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    
+    history = []
+    for role, content in rows:
+        history.append({
+            "role": role,
+            "parts": [content]
+        })
+    return history
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     user_text = update.message.text
@@ -261,22 +309,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         history = get_chat_history(chat_id)
         
-        # 1. API: Consultar partidos en tiempo real si menciona palabras clave
+        # 1. Consulta inteligente de partidos (Incluye Champions League y Promiedos)
         info_partidos = ""
-        palabras_clave_api = ["partido", "juega", "hoy", "resultado", "fecha", "tabla", "equipo", "vs", "partidos", "river", "boca"]
-        if any(palabra in user_text.lower() for palabra in palabras_clave_api):
-            datos_api = obtener_partidos_hoy()
-            if datos_api:
-                info_partidos = f"\n[Datos oficiales de partidos para hoy]:\n{datos_api}\n"
+        palabras_clave_partidos = ["partido", "juega", "hoy", "resultado", "fecha", "tabla", "equipo", "vs", "partidos", "champions", "champions league", "river", "boca", "real madrid", "barcelona", "laliga", "premier league", "ligue one", "bundesliga", "serie A"]
+        if any(palabra in user_text.lower() for palabra in palabras_clave_partidos):
+            datos_hibridos = obtener_partidos_inteligente(user_text)
+            if datos_hibridos:
+                info_partidos = f"\n{datos_hibridos}\n"
 
-        # 2. RAG: Buscar en PDFs si pregunta por reglamentos o historia
+        # 2. RAG: Buscar en PDFs locales
         info_rag = ""
         if any(w in user_text.lower() for w in ["reglamento", "articulo", "ley", "historia", "fundacion", "torneo", "formato"]):
             info_rag = buscar_en_pdfs(user_text)
             if info_rag:
                 info_rag = f"\n[Información extraída de documentos oficiales/reglamentos]:\n{info_rag}\n"
 
-        # 3. Análisis de Estadísticas si nombra a un equipo pidiendo racha o rendimiento
+        # 3. Estadísticas locales
         info_stats = ""
         if any(w in user_text.lower() for w in ["racha", "estadistica", "rendimiento", "ultimos partidos"]):
             palabras = user_text.split()
@@ -284,7 +332,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if equipo_buscado:
                 info_stats = f"\n{analizar_racha_equipo(equipo_buscado)}\n"
 
-        # 4. Contexto temporal en español
+        # 4. Contexto temporal exacto en español
         dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
         meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
         now = datetime.now()
@@ -312,7 +360,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⚠️ Tuve un problema técnico procesando tu mensaje.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja imágenes enviadas por el usuario (formaciones, tablas, etc.) y las analiza con Gemini."""
     chat_id = update.effective_chat.id
     
     try:
@@ -320,7 +367,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
         
-        user_caption = update.message.caption or "Analizá esta imagen de fútbol (formación, tabla o competición) y dame un resumen detallado."
+        user_caption = update.message.caption or "Analizá esta imagen de fútbol y dame un resumen detallado."
         
         chat = model.start_chat(history=[])
         response = chat.send_message([image, user_caption])
@@ -333,7 +380,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
     except Exception as e:
         logger.error(f"Error procesando imagen: {e}")
-        await update.message.reply_text("⚠️ Tuve un problema procesando la imagen. Intentá enviarla nuevamente.")
+        await update.message.reply_text("⚠️ Tuve un problema procesando la imagen.")
 
 def main() -> None:
     init_db()
@@ -350,7 +397,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    print("BotTin v4 con RAG, Estadísticas, API en tiempo real y Multimodalidad funcionando...")
+    print("BotTin v5_1_1 con Champions League, Promiedos, RAG y Estadísticas activo...")
     app.run_polling()
 
 if __name__ == "__main__":
