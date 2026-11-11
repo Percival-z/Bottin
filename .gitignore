@@ -1,4 +1,4 @@
 .venv/
 .env
+bottin_history.db
 __pycache__/
-.vscode/
