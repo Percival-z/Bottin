@@ -23,6 +23,10 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
+# Zona horaria IANA usada para filtrar y mostrar los partidos de API-Football.
+# Sin ella el filtro 'date' se interpreta en UTC y a la noche local se pide el
+# día equivocado. Se puede pisar desde el .env (ej. FOOTBALL_TIMEZONE=Europe/Madrid).
+FOOTBALL_TIMEZONE = os.getenv("FOOTBALL_TIMEZONE", "America/Argentina/Buenos_Aires")
 
 # Configuración del cliente de Gemini (SDK oficial google.genai)
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -194,40 +198,84 @@ logger = logging.getLogger(__name__)
 
 # --- ESTRATEGIA HÍBRIDA DE DATOS (API-FOOTBALL + CHAMPIONS + PROMIEDOS) ---
 
+# --- Caché en memoria de API-Football ---
+# El plan gratis admite 100 requests/día: se cachea el resultado del día
+# durante _CACHE_TTL_SEGUNDOS para no gastar cuota con cada consulta.
+_CACHE_PARTIDOS = {"key": None, "ts": 0.0, "value": ""}
+_CACHE_TTL_SEGUNDOS = 120
+
 def obtener_partidos_api() -> str:
     """Consulta los partidos del día en API-Football para Champions League y
-    grandes ligas europeas, con logs de diagnóstico."""
+    grandes ligas europeas, con logs de diagnóstico.
+
+    La fecha se envía junto con `timezone` para que el filtro 'date' se
+    interprete en la zona horaria del usuario (sin ella, la API filtra en UTC
+    y entre las 21:00 y medianoche local se pediría el día equivocado).
+    """
     if not FOOTBALL_API_KEY:
-        print("❌ ERROR: FOOTBALL_API_KEY no está configurada o está vacía en el .env")
+        logger.warning("FOOTBALL_API_KEY no está configurada o está vacía en el .env")
         return ""
-    
+
     hoy = datetime.now().strftime("%Y-%m-%d")
+
+    # Caché: misma fecha + misma zona horaria → respuesta ya conocida.
+    cache_key = f"{hoy}|{FOOTBALL_TIMEZONE}"
+    if _CACHE_PARTIDOS["key"] == cache_key:
+        edad = datetime.now().timestamp() - _CACHE_PARTIDOS["ts"]
+        if edad < _CACHE_TTL_SEGUNDOS:
+            logger.info(f"♻️ API-Football: usando caché ({int(edad)}s de antigüedad).")
+            return _CACHE_PARTIDOS["value"]
+
     url = "https://v3.football.api-sports.io/fixtures"
-    querystring = {"date": hoy}
+    querystring = {"date": hoy, "timezone": FOOTBALL_TIMEZONE}
     headers = {'x-apisports-key': FOOTBALL_API_KEY}
-    
-    print(f"🔍 Consultando API-Football para la fecha: {hoy}...")
-    
+
+    logger.info(f"🔍 Consultando API-Football para la fecha: {hoy} ({FOOTBALL_TIMEZONE})...")
+
     try:
         response = requests.get(url, headers=headers, params=querystring, timeout=10)
-        print(f"📡 Código de estado HTTP de la API: {response.status_code}")
-        
-        data = response.json()
-        
-        # Imprimir errores que devuelva la API misma (ej. clave inválida, límite superado)
-        if "errors" in data and data["errors"]:
-            print(f"⚠️ Errores devueltos por la API: {data['errors']}")
-            
-        matches = data.get("response", [])
-        print(f"⚽ Total de partidos devueltos por la API para hoy: {len(matches)}")
-        
-        if not matches:
+        logger.info(f"📡 Código de estado HTTP de la API: {response.status_code}")
+
+        # Cuota restante del día (header oficial de rate limit)
+        restante = response.headers.get("x-ratelimit-requests-remaining")
+        if restante is not None:
+            logger.info(f"🪙 Requests restantes hoy en API-Football: {restante}")
+
+        if response.status_code != 200:
+            logger.error(f"❌ API-Football respondió HTTP {response.status_code} (no se procesa la respuesta).")
             return ""
-            
-        # IDs permitidos: Champions League (2), Premier League (39), La Liga (140), Serie A (135), Bundesliga (78), Ligue 1 (61)
-        ligas_permitidas = [2, 39, 140, 135, 78, 61] 
+
+        data = response.json()
+
+        # Errores que devuelva la API misma (clave inválida, límite superado...)
+        if data.get("errors"):
+            logger.warning(f"⚠️ Errores devueltos por la API: {data['errors']}")
+            return ""
+
+        matches = data.get("response", [])
+        logger.info(f"⚽ Total de partidos devueltos por la API para hoy: {len(matches)}")
+
+        if not matches:
+            # Respuesta válida pero sin partidos: se cachea igual para no gastar cuota
+            _CACHE_PARTIDOS.update(key=cache_key, ts=datetime.now().timestamp(), value="")
+            return ""
+
+        # IDs permitidos: Champions League (2), Premier League (39), La Liga (140),
+        # Serie A (135), Bundesliga (78), Ligue 1 (61)
+        ligas_permitidas = [2, 39, 140, 135, 78, 61]
+
+        # Estados según la doc oficial de API-Football
+        estados_finalizados = ["FT", "AET", "PEN"]
+        estados_en_juego = ["1H", "HT", "2H", "ET", "BT", "P", "LIVE", "INT", "SUSP"]
+        estados_parados = {"PST": "Postergado", "CANC": "Cancelado",
+                           "ABD": "Abandonado", "AWD": "Resultado oficial",
+                           "WO": "Resultado oficial (WO)"}
+
+        # Etiqueta de hora local derivada de la zona horaria (ej. "Buenos Aires")
+        zona_label = FOOTBALL_TIMEZONE.split("/")[-1].replace("_", " ")
+
         resumen = []
-        
+
         for m in matches:
             if m["league"]["id"] in ligas_permitidas:
                 liga = m["league"]["name"]
@@ -236,26 +284,34 @@ def obtener_partidos_api() -> str:
                 goles_home = m["goals"]["home"]
                 goles_away = m["goals"]["away"]
                 estado = m["fixture"]["status"]["short"]
-                
-                if estado in ["FT", "AET", "PEN"]:
+
+                if estado in estados_finalizados:
                     marcador = f"{goles_home} - {goles_away} (Finalizado)"
-                elif estado in ["1H", "2H", "HT", "ET"]:
-                    marcador = f"{goles_home} - {goles_away} ¡En juego!"
+                elif estado in estados_en_juego:
+                    # En algunos estados los goles vienen en None
+                    marcador = f"{goles_home or 0} - {goles_away or 0} ¡En juego!"
+                elif estado in estados_parados:
+                    marcador = estados_parados[estado]
                 else:
-                    hora_utc = m["fixture"]["date"].split("T")[1][:5]
-                    marcador = f"A las {hora_utc} UTC"
-                    
+                    # NS / TBD: la fecha viene ya convertida por el parámetro timezone
+                    hora_local = m["fixture"]["date"].split("T")[1][:5]
+                    marcador = f"A las {hora_local} ({zona_label})"
+
                 resumen.append(f"- [{liga}] {local} vs {visita} -> {marcador}")
-                
+
         if not resumen:
-            print("ℹ️ Hubo partidos hoy, pero ninguno coincidió con las ligas configuradas.")
+            logger.info("ℹ️ Hubo partidos hoy, pero ninguno coincidió con las ligas configuradas.")
+            _CACHE_PARTIDOS.update(key=cache_key, ts=datetime.now().timestamp(), value="")
             return ""
-            
-        print(f"✅ Se filtraron {len(resumen)} partidos de las ligas de interés.")
-        return "\n".join(resumen[:15])
-        
+
+        logger.info(f"✅ Se filtraron {len(resumen)} partidos de las ligas de interés.")
+        resultado = "\n".join(resumen[:15])
+
+        _CACHE_PARTIDOS.update(key=cache_key, ts=datetime.now().timestamp(), value=resultado)
+        return resultado
+
     except Exception as e:
-        print(f"❌ Excepción crítica al conectar con API-Football: {e}")
+        logger.error(f"❌ Excepción crítica al conectar con API-Football: {e}")
         return ""
 
 def obtener_partidos_promiedos() -> str:
@@ -316,8 +372,9 @@ def obtener_partidos_promiedos() -> str:
         return ""
 
 # --- FUENTE ESPN (sin clave): jornadas anteriores y respaldo de hoy ---
-# La API-Football en el plan gratis solo admite la fecha de hoy, así que para
-# "últimos partidos" / "jornada pasada" se usa el scoreboard público de ESPN.
+# API-Football en el plan gratis solo cubre temporadas recientes y tiene
+# 100 requests/día, así que para "últimos partidos" / "jornada pasada" se usa
+# el scoreboard público de ESPN (sin clave ni cuota).
 
 # (slug de ESPN, nombre para mostrar, palabras clave que lo activan)
 LIGAS_ESPN = [
@@ -329,7 +386,7 @@ LIGAS_ESPN = [
       "newcastle", "brighton", "aston villa", "sunderland"]),
     ("esp.1", "LaLiga",
      ["laliga", "españa", "espana", "real madrid", "barcelona", "atletico"]),
-    ("it.1", "Serie A",
+    ("ita.1", "Serie A",
      ["serie a", "italia", "juventus", "milan", "napoli", "fiorentina", "lazio"]),
     ("ger.1", "Bundesliga",
      ["bundesliga", "alemania", "bayern", "dortmund", "leverkusen"]),
