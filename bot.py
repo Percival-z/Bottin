@@ -955,14 +955,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.effective_chat.id, usuario.id, usuario.username, usuario.first_name
     )
     await update.message.reply_text(
-        f"¡Hola, {usuario.first_name}! ⚽ Soy BotTin v5_2, tu asistente con Champions League, "
+        f"¡Hola, {usuario.first_name}! ⚽ Soy BotTin , tu asistente con Champions League, "
         f"Promiedos, estadísticas y RAG. Escribí /help para más info."
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Responde al comando /help mostrando la lista de comandos disponibles."""
     await update.message.reply_text(
-        "🤖 **BotTin v5_2 (Gemini + SQLite)**\n"
+        "🤖 **BotTin  (Gemini + SQLite)**\n"
         "Podés preguntarme por partidos de hoy (Champions, ligas europeas, selecciones o "
         "fútbol argentino), tablas de posiciones, estadísticas, reglamentos o enviarme "
         "imágenes o notas de voz. "
@@ -1320,7 +1320,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_audio))
 
-    print("BotTin v5_2 (Gemini + SQLite) con Champions League, Promiedos, RAG y Estadísticas activo... "
+    print("BotTin  (Gemini + SQLite) con Champions League, Promiedos, RAG y Estadísticas activo... "
           "Presioná Ctrl+C para detenerlo.")
     app.run_polling()
 
