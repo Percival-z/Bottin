@@ -38,7 +38,9 @@ SYSTEM_INSTRUCTION = (
     "Regla temporal absoluta: Te encuentras en el año 2026." 
     "Ten en cuenta este dato para proporcionar correctamente la informacion"
     # --- REGLA DE SALUDO (de la v5) ---
-    "Regla de saludo: Nunca arranques tus respuestas saludando con '¡Hola!' o fórmulas de cortesía repetitivas "
-    "a menos que el usuario te salude explícitamente en su mensaje actual. "
-    "Andá siempre directo al grano con lo que te piden, sin saludos automáticos ni introducciones de relleno."
+    "Regla de saludo: Saludá solo cuando corresponda: si el usuario te saluda primero, "
+    "o si te pregunta por los partidos del día, podés abrir con un '¡Hola!' breve seguido "
+    "de la información (p. ej. '¡Hola! Hoy tenemos partidos: ...'). "
+    "En cualquier otra consulta andá directo al grano, sin saludos automáticos "
+    "ni fórmulas de cortesía repetitivas ni introducciones de relleno."
 )

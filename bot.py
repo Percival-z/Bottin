@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -136,7 +137,8 @@ def delete_user(chat_id: int) -> int:
     return eliminados
 
 def init_stats_db():
-    """Crea una tabla para estadísticas históricas si no existe."""
+    """Crea las tablas de estadísticas locales si no existen: partidos de los
+    equipos (racha), goleadores recientes y tablas de posiciones cacheadas."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -150,44 +152,480 @@ def init_stats_db():
             date TEXT
         )
     ''')
+    # El mismo partido no debe guardarse dos veces (ESPN lo devuelve tanto en el
+    # scoreboard como en el calendario del equipo).
+    cursor.execute(
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_team_matches_unico '
+        'ON team_matches(team, opponent, date)'
+    )
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS team_scorers_cache (
+            team_key TEXT PRIMARY KEY,
+            payload TEXT,
+            updated_at TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS standings_cache (
+            league TEXT PRIMARY KEY,
+            payload TEXT,
+            updated_at TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS team_loaded (
+            team_key TEXT PRIMARY KEY,
+            updated_at TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
-def analizar_racha_equipo(nombre_equipo: str) -> str:
-    """Consulta SQLite, calcula estadísticas recientes y genera un informe de racha."""
+# --- HISTORIAL DE PARTIDOS Y RACHA (SQLite + ESPN) ---
+# La API-Football del plan gratis solo admite la fecha de hoy (y temporadas
+# 2022-2024), así que los últimos partidos de un equipo se cargan desde el
+# calendario público de ESPN (sin clave ni cuota) y quedan guardados en SQLite.
+
+_TTL_CACHES_SEGUNDOS = 6 * 3600   # equipos, calendarios, goleadores y resúmenes
+
+_CACHE_LIGAS_EQUIPOS: dict[str, tuple[float, list[tuple[int, str, str]]]] = {}
+_CACHE_RESOLUCION: dict[str, tuple[float, tuple[str, int, str]]] = {}
+_CACHE_CALENDARIO: dict[tuple[str, int], tuple[float, list[dict]]] = {}
+_CACHE_RESUMENES: dict[tuple[int, str], tuple[float, list[str]]] = {}
+_CACHE_DOCUMENTOS = {"ts": 0.0, "paginas": None}
+
+_STOPWORDS_EQUIPO = {
+    "de", "del", "la", "el", "los", "las", "un", "una", "unos", "unas", "al", "en",
+    "para", "por", "con", "y", "o", "que", "se", "como", "sobre", "entre", "su",
+    "sus", "mi", "mis", "tu", "dame", "decime", "quiero", "ver", "hace", "hazme",
+    "haceme", "hacer", "cuál", "cual", "cuando", "cuándo", "es", "son", "esta",
+    "está", "este", "esto", "estos", "estas", "me", "lo", "le", "les", "nos",
+    "racha", "forma", "estadística", "estadísticas", "estadistica", "estadisticas",
+    "rendimiento", "partido", "partidos", "último", "últimos", "última", "últimas",
+    "ultimo", "ultimos", "ultima", "ultimas", "reciente", "recientes", "jugados",
+    "jugadas", "equipo", "equipos", "resultado", "resultados", "historial",
+    "histórico", "historico", "actual", "actualmente", "contra", "favor", "ganados",
+    "ganadas", "perdidos", "perdidas", "empatados", "los", "las", "jugó", "jugaron",
+    "había", "hizo", "viene", "estuvo", "desde", "hasta", "sus", "cómo", "quién",
+    "quien", "dónde", "donde", "qué", "cuyos", "todos", "mismo", "mismos",
+}
+
+def _sin_acentos(texto: str) -> str:
+    """Quita las tildes conservando el resto del texto."""
+    descompuesto = unicodedata.normalize("NFKD", str(texto))
+    return "".join(c for c in descompuesto if not unicodedata.combining(c))
+
+def _normalizar_nombre(texto: str) -> str:
+    """Minúsculas, sin acentos, sin puntuación y con espacios simples: sirve para
+    comparar nombres de equipos aunque el usuario escriba distinto que la fuente."""
+    texto = _sin_acentos(texto).lower()
+    texto = re.sub(r"[^\w\s]", " ", texto)
+    texto = texto.replace("_", " ")
+    return re.sub(r"\s+", " ", texto).strip()
+
+def _extraer_equipo(texto: str) -> str:
+    """Última palabra que parece nombre de equipo (saca puntuación y palabras de
+    relleno): 'Dame las estadísticas de los últimos partidos de Boca.' → 'Boca'."""
+    palabras = re.findall(r"[\wáéíóúüñÁÉÍÓÚÜÑ-]+", str(texto))
+    candidatos = [
+        p for p in palabras
+        if len(p) >= 3
+        and not p.isdigit()
+        and p.lower().strip("-") not in _STOPWORDS_EQUIPO
+    ]
+    return candidatos[-1] if candidatos else ""
+
+def _resultado_del_partido(a_favor: int, en_contra: int) -> str:
+    if a_favor > en_contra:
+        return "G"
+    return "E" if a_favor == en_contra else "P"
+
+def _consultar_historial(nombre: str) -> tuple[str | None, list[tuple]]:
+    """Partidos guardados en SQLite que coinciden con `nombre`.
+
+    Devuelve (equipo elegido, filas), donde las filas son
+    (team, opponent, result, goals_for, goals_against, date) ordenadas de la más
+    reciente a la más vieja. Si el nombre pega con varios equipos, se queda con
+    el que más partidos tiene ("river" → "River Plate")."""
+    patron = _normalizar_nombre(nombre).replace("%", "").replace("_", "")
+    if not patron:
+        return None, []
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT result, goals_for, goals_against, opponent, date 
-        FROM team_matches 
-        WHERE team LIKE ? 
-        ORDER BY id DESC LIMIT 5
-    ''', (f"%{nombre_equipo}%",))
-    
-    rows = cursor.fetchall()
-    conn.close()
-    
-    if not rows:
-        return f"No encontré registros históricos recientes en la base de datos local para el equipo '{nombre_equipo}'."
-    
-    total_partidos = len(rows)
-    ganados = sum(1 for r in rows if r[0] == 'G')
-    empatados = sum(1 for r in rows if r[0] == 'E')
-    perdidos = sum(1 for r in rows if r[0] == 'P')
-    goles_favor = sum(r[1] for r in rows)
-    goles_contra = sum(r[2] for r in rows)
-    
-    porcentaje_victorias = (ganados / total_partidos) * 100
-    
-    informe = (
-        f"📊 **Informe Estadístico y de Racha ({nombre_equipo.upper()})**:\n"
-        f"- Partidos analizados: {total_partidos}\n"
-        f"- Victorias: {ganados} | Empates: {empatados} | Derrotas: {perdidos}\n"
-        f"- Efectividad de victorias: {porcentaje_victorias:.1f}%\n"
-        f"- Goles a favor: {goles_favor} | Goles en contra: {goles_contra}\n"
+    try:
+        filas = conn.execute(
+            """SELECT team, opponent, result, goals_for, goals_against, date
+               FROM team_matches WHERE team LIKE ? ORDER BY date DESC""",
+            (f"%{patron}%",),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not filas:
+        return None, []
+    por_equipo: dict[str, list[tuple]] = {}
+    for fila in filas:
+        por_equipo.setdefault(fila[0], []).append(fila)
+    elegido = max(por_equipo, key=lambda e: (len(por_equipo[e]), -len(e)))
+    return elegido, por_equipo[elegido]
+
+def _equipo_pendiente_de_cargar(clave: str) -> bool:
+    """True si los partidos de ese equipo no se cargaron (o se cargaron hace más
+    de _TTL_CACHES_SEGUNDOS): evita repetir la descarga en cada consulta."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        fila = conn.execute(
+            "SELECT updated_at FROM team_loaded WHERE team_key = ?", (clave,)).fetchone()
+    finally:
+        conn.close()
+    if not fila:
+        return True
+    try:
+        transcurrido = (datetime.now() - datetime.fromisoformat(fila[0])).total_seconds()
+    except Exception:
+        return True
+    return transcurrido > _TTL_CACHES_SEGUNDOS
+
+def _marcar_equipo_cargado(clave: str) -> None:
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            """INSERT INTO team_loaded (team_key, updated_at) VALUES (?, ?)
+               ON CONFLICT(team_key) DO UPDATE SET updated_at = excluded.updated_at""",
+            (clave, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def _guardar_partidos(partidos: list[tuple]) -> int:
+    """Guarda filas (team, opponent, result, gf, ga, date) en SQLite. Devuelve la
+    cantidad de registros nuevos (los repetidos se ignoran por el índice único)."""
+    if not partidos:
+        return 0
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        cambios_antes = conn.total_changes
+        conn.executemany(
+            """INSERT OR IGNORE INTO team_matches
+               (team, opponent, result, goals_for, goals_against, date)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            partidos,
+        )
+        conn.commit()
+        return conn.total_changes - cambios_antes
+    finally:
+        conn.close()
+
+def _gole_del_competidor(competidor: dict) -> int | None:
+    marcador = competidor.get("score")
+    if isinstance(marcador, dict):
+        marcador = marcador.get("value")
+    if marcador is None:
+        return None
+    try:
+        return int(float(marcador))
+    except (TypeError, ValueError):
+        return None
+
+def _evento_finalizado(evento: dict) -> tuple[str, str, int, str, int] | None:
+    """(fecha, local, goles local, visita, goles visita) si el evento de ESPN terminó."""
+    competicion = (evento.get("competitions") or [{}])[0]
+    estado = (competicion.get("status") or evento.get("status") or {}).get("type", {}) or {}
+    if estado.get("state") != "post" and estado.get("name") != "STATUS_FULL_TIME":
+        return None
+    competidores = competicion.get("competitors") or []
+    local = next((c for c in competidores if c.get("homeAway") == "home"), None)
+    visita = next((c for c in competidores if c.get("homeAway") == "away"), None)
+    if not local or not visita:
+        return None
+    nombre_local = ((local.get("team") or {}).get("displayName")
+                    or (local.get("team") or {}).get("name") or "")
+    nombre_visita = ((visita.get("team") or {}).get("displayName")
+                     or (visita.get("team") or {}).get("name") or "")
+    goles_local, goles_visita = _gole_del_competidor(local), _gole_del_competidor(visita)
+    fecha = (evento.get("date") or "")[:10]
+    if not fecha or not nombre_local or not nombre_visita or goles_local is None or goles_visita is None:
+        return None
+    return fecha, nombre_local, goles_local, nombre_visita, goles_visita
+
+def _guardar_eventos(eventos: list[dict]) -> int:
+    """Vuelve eventos de ESPN en filas de team_matches (uno por cada equipo)."""
+    filas = []
+    for evento in eventos:
+        fin = _evento_finalizado(evento)
+        if not fin:
+            continue
+        fecha, local, goles_local, visita, goles_visita = fin
+        filas.append((local, visita, _resultado_del_partido(goles_local, goles_visita),
+                      goles_local, goles_visita, fecha))
+        filas.append((visita, local, _resultado_del_partido(goles_visita, goles_local),
+                      goles_visita, goles_local, fecha))
+    return _guardar_partidos(filas)
+
+def _equipos_de_liga(slug: str) -> list[tuple[int, str, str]]:
+    """Equipos de una liga de ESPN: [(id, nombre, nombre para mostrar)]."""
+    ahora = datetime.now().timestamp()
+    cache = _CACHE_LIGAS_EQUIPOS.get(slug)
+    if cache and ahora - cache[0] < _TTL_CACHES_SEGUNDOS:
+        return cache[1]
+    url = f"http://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/teams"
+    equipos: list[tuple[int, str, str]] = []
+    try:
+        respuesta = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if respuesta.status_code == 200:
+            datos = respuesta.json()
+            ligas = list(datos.get("leagues") or [])
+            for deporte in datos.get("sports") or []:
+                ligas += deporte.get("leagues") or []
+            for liga in ligas:
+                for equipo in liga.get("teams") or []:
+                    info = equipo.get("team") or {}
+                    if info.get("id") and (info.get("displayName") or info.get("name")):
+                        equipos.append((
+                            int(info["id"]),
+                            str(info.get("name") or info.get("displayName")),
+                            str(info.get("displayName") or info.get("name")),
+                        ))
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudieron leer los equipos de ESPN ({slug}): {e}")
+    if equipos:
+        _CACHE_LIGAS_EQUIPOS[slug] = (ahora, equipos)
+    return equipos
+
+def _resolver_equipo_espn(nombre: str) -> tuple[str, int, str] | None:
+    """Busca un equipo por nombre en las ligas conocidas de ESPN → (slug, id, nombre)."""
+    objetivo = _normalizar_nombre(nombre)
+    if not objetivo:
+        return None
+    ahora = datetime.now().timestamp()
+    cache = _CACHE_RESOLUCION.get(objetivo)
+    if cache and ahora - cache[0] < _TTL_CACHES_SEGUNDOS:
+        return cache[1]
+    slugs = [slug for slug, _, _ in LIGAS_ESPN] + list(SLUGS_SELECCION_ESPN)
+    mejor: tuple[tuple[int, int], tuple[str, int, str]] | None = None
+    for slug in slugs:
+        for team_id, nombre_api, display in _equipos_de_liga(slug):
+            variantes = {_normalizar_nombre(display), _normalizar_nombre(nombre_api)}
+            if objetivo in variantes:
+                prioridad = 0
+            elif any(objetivo in v or v in objetivo for v in variantes if v):
+                prioridad = 1
+            else:
+                continue
+            clave = (prioridad, len(display))
+            if mejor is None or clave < mejor[0]:
+                mejor = (clave, (slug, team_id, display))
+        if mejor and mejor[0][0] == 0:
+            break
+    if not mejor:
+        return None
+    _CACHE_RESOLUCION[objetivo] = (ahora, mejor[1])
+    return mejor[1]
+
+def _calendario_espn(slug: str, team_id: int) -> list[dict]:
+    """Partidos de la temporada (y la anterior como respaldo) de un equipo en ESPN."""
+    ahora = datetime.now().timestamp()
+    clave = (slug, team_id)
+    cache = _CACHE_CALENDARIO.get(clave)
+    if cache and ahora - cache[0] < _TTL_CACHES_SEGUNDOS:
+        return cache[1]
+    url = f"http://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/teams/{team_id}/schedule"
+    temporada = datetime.now().year
+    eventos: list[dict] = []
+    for anio in (temporada, temporada - 1):
+        try:
+            respuesta = requests.get(url, params={"season": anio},
+                                     headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if respuesta.status_code == 200:
+                eventos = respuesta.json().get("events") or []
+        except Exception as e:
+            logger.warning(f"⚠️ Error consultando el calendario de ESPN ({slug}/{team_id}): {e}")
+            eventos = []
+        if eventos:
+            break
+    if eventos:
+        _CACHE_CALENDARIO[clave] = (ahora, eventos)
+    return eventos
+
+def _goleadores_en_partido(event_id: int, nombre_equipo: str, slug: str) -> list[str]:
+    """Jugadores del equipo que marcaron gol en un partido. Usa los `keyEvents`
+    estructurados de ESPN (scoringPlay) y, si no vienen, el commentary en texto.
+    Los vacíos no se cachean: si ESPN no respondió, se reintenta la próxima vez."""
+    objetivo = _normalizar_nombre(nombre_equipo)
+    clave_cache = (event_id, objetivo)
+    ahora = datetime.now().timestamp()
+    cache = _CACHE_RESUMENES.get(clave_cache)
+    if cache and ahora - cache[0] < _TTL_CACHES_SEGUNDOS:
+        return cache[1]
+    goleadores: list[str] = []
+    try:
+        respuesta = requests.get(
+            f"http://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/summary",
+            params={"event": event_id}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if respuesta.status_code == 200:
+            datos = respuesta.json()
+            goles = [e for e in datos.get("keyEvents") or [] if e.get("scoringPlay")]
+            for gol in goles:
+                equipo = _normalizar_nombre((gol.get("team") or {}).get("displayName") or "")
+                if not (objetivo and objetivo in equipo):
+                    continue
+                participantes = gol.get("participants") or []
+                atleta = (participantes[0].get("athlete") or {}) if participantes else {}
+                if atleta.get("displayName"):
+                    goleadores.append(atleta["displayName"])
+            if not goles:
+                # Respaldo: "Goal! Boca Juniors 1, River 0. Enner Valencia (Boca Juniors) ..."
+                for entrada in datos.get("commentary") or []:
+                    texto = (entrada.get("text") or "").strip()
+                    bajo = texto.lower()
+                    if not (bajo.startswith("goal!") or bajo.startswith("penalty scored")):
+                        continue
+                    for coincidencia in re.finditer(
+                            r"([A-ZÁÉÍÓÚÑ][^()\d.,:]{2,60}?)\s*\(([^)]+)\)", texto):
+                        jugador = coincidencia.group(1).strip()
+                        equipo = _normalizar_nombre(coincidencia.group(2))
+                        if jugador and objetivo and objetivo in equipo:
+                            goleadores.append(jugador)
+                            break
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudieron leer los goleadores del partido {event_id}: {e}")
+        return []
+    if goleadores:
+        _CACHE_RESUMENES[clave_cache] = (ahora, goleadores)
+    return goleadores
+
+def _leer_goleadores(clave: str) -> list[tuple[str, int]] | None:
+    """Goleadores guardados del equipo; None si no hay o vencieron (6 h)."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        fila = conn.execute(
+            "SELECT payload, updated_at FROM team_scorers_cache WHERE team_key = ?",
+            (clave,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not fila:
+        return None
+    try:
+        if (datetime.now() - datetime.fromisoformat(fila[1])).total_seconds() > _TTL_CACHES_SEGUNDOS:
+            return None
+        datos = json.loads(fila[0])
+    except Exception:
+        return None
+    return [(d["jugador"], int(d["goles"])) for d in datos]
+
+def _actualizar_goleadores(clave: str, nombre_equipo: str, slug: str, eventos: list[dict]) -> None:
+    """Calcula los goleadores del equipo en sus últimos 5 partidos y los guarda."""
+    if _leer_goleadores(clave) is not None:
+        return
+    finalizados = [e for e in eventos if _evento_finalizado(e)]
+    finalizados.sort(key=lambda e: e.get("date") or "", reverse=True)
+    contador: dict[str, int] = {}
+    for evento in finalizados[:5]:
+        try:
+            event_id = int(evento.get("id"))
+        except (TypeError, ValueError):
+            continue
+        # El resumen se pide en la liga del partido (una Copa puede no estar en la liga del equipo)
+        slug_partido = (evento.get("league") or {}).get("slug") or slug
+        for jugador in _goleadores_en_partido(event_id, nombre_equipo, slug_partido):
+            contador[jugador] = contador.get(jugador, 0) + 1
+    payload = [
+        {"jugador": j, "goles": g}
+        for j, g in sorted(contador.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            """INSERT INTO team_scorers_cache (team_key, payload, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(team_key) DO UPDATE SET
+                   payload = excluded.payload,
+                   updated_at = excluded.updated_at""",
+            (clave, json.dumps(payload, ensure_ascii=False), datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def poblar_historial_equipo(nombre: str) -> bool:
+    """Descarga desde ESPN los últimos partidos y goleadores del equipo y los deja
+    guardados en SQLite. Devuelve True si hay datos en la base para ese nombre."""
+    resuelto = _resolver_equipo_espn(nombre)
+    if resuelto:
+        slug, team_id, display = resuelto
+        clave = _normalizar_nombre(nombre)
+        eventos = _calendario_espn(slug, team_id)
+        if eventos and _equipo_pendiente_de_cargar(clave):
+            nuevos = _guardar_eventos(eventos)
+            _marcar_equipo_cargado(clave)
+            logger.info(f"🗂️ Se cargaron {nuevos} registros de partidos de {display} en SQLite.")
+        if eventos:
+            try:
+                _actualizar_goleadores(clave, display, slug, eventos)
+            except Exception as e:
+                logger.warning(f"⚠️ No se pudieron actualizar los goleadores de {display}: {e}")
+    _, filas = _consultar_historial(nombre)
+    return bool(filas)
+
+def analizar_racha_equipo(nombre_equipo: str) -> str:
+    """Informe de racha con salida lista para armar la respuesta: porcentaje de
+    victorias, goles a favor/en contra, forma reciente y goleador del período.
+    Los datos viven en SQLite y se refrescan desde ESPN si son viejos."""
+    nombre = _extraer_equipo(nombre_equipo)
+    if not nombre:
+        return ("No pude identificar de qué equipo querés la racha. "
+                "Escribime, por ejemplo: 'racha de Boca'.")
+
+    # Si en la base no hay datos frescos, se descargan (si falla la red, se
+    # responde igual con lo que ya esté guardado).
+    try:
+        poblar_historial_equipo(nombre)
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo actualizar el historial de {nombre}: {e}")
+
+    equipo, filas = _consultar_historial(nombre)
+    if not equipo or not filas:
+        return (f"No encontré registros históricos en la base de datos local "
+                f"para el equipo '{nombre}'. Probá de nuevo en unos minutos.")
+
+    recientes = filas[:5]
+    total = len(recientes)
+    ganados = sum(1 for f in recientes if f[2] == "G")
+    empatados = sum(1 for f in recientes if f[2] == "E")
+    perdidos = sum(1 for f in recientes if f[2] == "P")
+    goles_favor = sum(f[3] for f in recientes)
+    goles_contra = sum(f[4] for f in recientes)
+    porcentaje_victorias = (ganados / total) * 100
+
+    simbolos = {"G": "✅", "E": "➖", "P": "❌"}
+    lineas_forma = []
+    for _, rival, resultado, a_favor, en_contra, fecha in recientes:
+        try:
+            fecha = datetime.fromisoformat(fecha).strftime("%d/%m/%Y")
+        except Exception:
+            pass
+        lineas_forma.append(
+            f"  {simbolos.get(resultado, '•')} {fecha}: {equipo} {a_favor}-{en_contra} {rival}"
+        )
+
+    goleadores = _leer_goleadores(_normalizar_nombre(nombre)) or []
+    bloque_goleador = ""
+    if goleadores:
+        principal = goleadores[0]
+        otros = ", ".join(f"{jugador} ({goles})" for jugador, goles in goleadores[1:3])
+        bloque_goleador = (f"- Goleador del período: {principal[0]} con {principal[1]} tantos"
+                           + (f"; también {otros}." if otros else ".") + "\n")
+
+    return (
+        f"📊 Informe de racha ({equipo}) — últimos {total} partidos:\n"
+        f"- Victorias: {ganados} | Empates: {empatados} | Derrotas: {perdidos} "
+        f"(efectividad de victorias {porcentaje_victorias:.1f}%)\n"
+        f"- Goles a favor: {goles_favor} | Goles en contra: {goles_contra} "
+        f"(promedio {goles_favor / total:.1f} a favor y {goles_contra / total:.1f} en contra por partido)\n"
+        f"- Forma reciente (de más reciente a más viejo):\n"
+        + "\n".join(lineas_forma) + "\n"
+        + bloque_goleador
     )
-    return informe
 
 # --- CONFIGURACIÓN DE LOGS ---
 logging.basicConfig(
@@ -539,7 +977,16 @@ def _pedir_espn(slug: str, fecha: datetime) -> list[dict]:
         return []
 
 def _formatear_espn(events: list[dict], nombre_liga: str) -> list[str]:
-    """Convierte los eventos de ESPN en líneas con el mismo formato del resto."""
+    """Convierte los eventos de ESPN en líneas con el mismo formato del resto.
+
+    De paso guarda los partidos finalizados en SQLite: cada consulta de partidos
+    va nutriendo la base local que después usa el análisis de racha."""
+    try:
+        nuevos = _guardar_eventos(events)
+        if nuevos:
+            logger.info(f"🗂️ {nuevos} partidos nuevos de {nombre_liga} guardados en SQLite para rachas.")
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudieron guardar los partidos de {nombre_liga}: {e}")
     lineas = []
     for e in events:
         competencia = (e.get("competitions") or [{}])[0]
@@ -834,6 +1281,41 @@ def _formatear_tabla(tabla: dict, max_filas: int = 20) -> list[str]:
         lineas.append(f"- {pos}. {equipo} | {pts} pts | PJ {pj} | G {g} E {e} P {p}{extra}")
     return lineas
 
+def _guardar_tabla_cache(clave: str, contenido: str) -> None:
+    """Guarda una tabla de posiciones ya formateada en SQLite (respaldo local)."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            """INSERT INTO standings_cache (league, payload, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(league) DO UPDATE SET
+                   payload = excluded.payload,
+                   updated_at = excluded.updated_at""",
+            (clave, contenido, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def _leer_tabla_cache(clave: str) -> str:
+    """Última tabla de posiciones guardada de esa competencia (vacío si no hay)."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        fila = conn.execute(
+            "SELECT payload, updated_at FROM standings_cache WHERE league = ?",
+            (clave,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not fila:
+        return ""
+    try:
+        fecha = datetime.fromisoformat(fila[1]).strftime("%d/%m/%Y a las %H:%M")
+    except Exception:
+        fecha = "una fecha anterior"
+    return (fila[0]
+            + f"\n- (Nota: no se pudo actualizar la tabla ahora; se muestran los datos "
+              f"guardados el {fecha}.)")
+
 def obtener_tabla_posiciones(user_text: str) -> str:
     """Devuelve la tabla de posiciones de la liga que menciona el usuario
     (scrapper de Promiedos). Si no aclara la liga, devuelve un aviso para que
@@ -866,7 +1348,12 @@ def obtener_tabla_posiciones(user_text: str) -> str:
 
     grupos = _tablas_promiedos(url_name, id_liga)
     if not grupos:
-        return ""
+        # Si Promiedos no respondió (o volvió a cambiar su web), se responde con
+        # la última tabla de esa competencia guardada en SQLite.
+        cache = _leer_tabla_cache(nombre_liga)
+        if cache:
+            logger.warning(f"⚠️ Promiedos sin datos de {nombre_liga}: se usa el caché local de SQLite.")
+        return cache
 
     # Candidatas: (nombre del grupo, nombre de la tabla, tabla con filas)
     candidatas = []
@@ -916,35 +1403,109 @@ def obtener_tabla_posiciones(user_text: str) -> str:
     resultado = "\n".join(bloques)
     if truncado:
         resultado += "\n- (Nota: la competencia tiene más grupos; se muestran solo los primeros 6.)"
+    _guardar_tabla_cache(nombre_liga, resultado)
     logger.info(f"📊 Tabla de posiciones de {nombre_liga} obtenida de Promiedos "
                 f"({len(elegidas)} tabla(s)).")
     return resultado
 
-# --- RAG CON PDFS ---
+# --- RAG CON DOCUMENTOS (PDF, TXT y MD en la carpeta 'docs/') ---
+
+def _paginas_de_documento(path: str) -> list[tuple[int, str]]:
+    """[(número de página, texto)] de un PDF, o una única 'página' para TXT/MD."""
+    if path.lower().endswith(".pdf"):
+        paginas = []
+        try:
+            reader = PdfReader(path)
+            for i, page in enumerate(reader.pages):
+                texto = page.extract_text() or ""
+                if texto.strip():
+                    paginas.append((i + 1, texto))
+        except Exception as e:
+            logger.error(f"Error leyendo PDF {os.path.basename(path)}: {e}")
+        return paginas
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as archivo:
+            return [(1, archivo.read())]
+    except Exception as e:
+        logger.error(f"Error leyendo {os.path.basename(path)}: {e}")
+        return []
+
+def _documentos_cargados() -> list[tuple[str, int, str]]:
+    """Todos los documentos de 'docs/' como (archivo, página, texto), con caché de
+    10 minutos para no releer los PDFs en cada consulta."""
+    ahora = datetime.now().timestamp()
+    if _CACHE_DOCUMENTOS["paginas"] is not None and ahora - _CACHE_DOCUMENTOS["ts"] < 600:
+        return _CACHE_DOCUMENTOS["paginas"]
+    docs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
+    paginas: list[tuple[str, int, str]] = []
+    if os.path.isdir(docs_dir):
+        for filename in sorted(os.listdir(docs_dir)):
+            if filename.lower().endswith((".pdf", ".txt", ".md")):
+                for numero, texto in _paginas_de_documento(os.path.join(docs_dir, filename)):
+                    paginas.append((filename, numero, texto))
+    _CACHE_DOCUMENTOS.update(ts=ahora, paginas=paginas)
+    return paginas
+
+def _trocear(texto: str, tamanio: int = 1200) -> list[str]:
+    """Troza un texto en fragmentos de ~tamanio caracteres por párrafos, sin cortar
+    oraciones: así el RAG manda los fragmentos más manejables al modelo."""
+    trozos: list[str] = []
+    actual = ""
+    for parrafo in texto.split("\n\n"):
+        parrafo = re.sub(r"\s+", " ", parrafo).strip()
+        if not parrafo:
+            continue
+        # Párrafos más largos que el trozo se parten primero por espacios
+        while len(parrafo) > tamanio:
+            corte = parrafo.rfind(" ", 0, tamanio)
+            if corte < tamanio // 2:
+                corte = tamanio
+            trozos.append(parrafo[:corte].strip())
+            parrafo = parrafo[corte:].strip()
+        if not parrafo:
+            continue
+        if actual and len(actual) + len(parrafo) + 2 > tamanio:
+            trozos.append(actual)
+            actual = parrafo
+        else:
+            actual = f"{actual}\n\n{parrafo}" if actual else parrafo
+    if actual:
+        trozos.append(actual)
+    return trozos
+
+_STOPWORDS_RAG = {
+    "cual", "cuales", "cuál", "cuáles", "como", "cómo", "donde", "dónde",
+    "cuando", "cuándo", "quien", "quienes", "quién", "quiénes", "sobre",
+    "entre", "para", "porque", "desde", "hasta", "puede", "pueden", "hoy",
+    "partido", "partidos", "equipo", "equipos", "jugaron", "jugadores",
+}
 
 def buscar_en_pdfs(query: str) -> str:
-    """Busca fragmentos relevantes dentro de los PDFs en la carpeta 'docs/'."""
-    docs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
-    if not os.path.exists(docs_dir):
+    """Busca los fragmentos más relevantes de los documentos locales para la
+    consulta: puntúa cada trozo según cuántas palabras clave repite (con tope por
+    palabra, para que una repetida como 'copa' no domine) y cuántas distintas
+    aparecen, y devuelve los 3 mejores."""
+    claves = [c for c in (_normalizar_nombre(p) for p in query.split())
+              if len(c) > 3 and c not in _STOPWORDS_RAG]
+    if not claves:
         return ""
-    
-    contexto_encontrado = ""
-    palabras_clave = [p.lower() for p in query.split() if len(p) > 3]
-    
-    for filename in os.listdir(docs_dir):
-        if filename.endswith(".pdf"):
-            path = os.path.join(docs_dir, filename)
-            try:
-                reader = PdfReader(path)
-                for i, page in enumerate(reader.pages):
-                    texto = page.extract_text()
-                    if texto:
-                        if any(palabra in texto.lower() for palabra in palabras_clave):
-                            contexto_encontrado += f"\n[Fuente: {filename} - Pág {i+1}]:\n{texto[:1000]}...\n"
-            except Exception as e:
-                logger.error(f"Error leyendo PDF {filename}: {e}")
-                
-    return contexto_encontrado
+    candidatos = []
+    for archivo, pagina, texto in _documentos_cargados():
+        for trozo in _trocear(texto):
+            normalizado = _normalizar_nombre(trozo)
+            conteos = [(clave, normalizado.count(clave)) for clave in claves]
+            presentes = [n for _, n in conteos if n]
+            if not presentes:
+                continue
+            puntaje = sum(min(n, 3) for n in presentes) + 2 * len(presentes)
+            candidatos.append((puntaje, archivo, pagina, trozo))
+    if not candidatos:
+        return ""
+    candidatos.sort(key=lambda c: (-c[0], len(c[3])))
+    contexto = ""
+    for _, archivo, pagina, trozo in candidatos[:3]:
+        contexto += f"\n[Fuente: {archivo} - Pág {pagina}]:\n{trozo[:1400]}\n"
+    return contexto
 
 # --- HANDLERS DE TELEGRAM ---
 
@@ -955,14 +1516,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.effective_chat.id, usuario.id, usuario.username, usuario.first_name
     )
     await update.message.reply_text(
-        f"¡Hola, {usuario.first_name}! ⚽ Soy BotTin , tu asistente con Champions League, "
+        f"¡Hola, {usuario.first_name}! ⚽ Soy BotTin v5_2, tu asistente con Champions League, "
         f"Promiedos, estadísticas y RAG. Escribí /help para más info."
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Responde al comando /help mostrando la lista de comandos disponibles."""
     await update.message.reply_text(
-        "🤖 **BotTin  (Gemini + SQLite)**\n"
+        "🤖 **BotTin v5_2 (Gemini + SQLite)**\n"
         "Podés preguntarme por partidos de hoy (Champions, ligas europeas, selecciones o "
         "fútbol argentino), tablas de posiciones, estadísticas, reglamentos o enviarme "
         "imágenes o notas de voz. "
@@ -1079,18 +1640,28 @@ async def generar_respuesta(chat_id: int, user_text: str) -> str:
             if datos_hibridos:
                 info_partidos = f"\n{datos_hibridos}\n"
 
-        # 4. RAG: Buscar en PDFs locales
+        # 4. RAG: buscar en los documentos locales (reglamentos, historias y formatos)
         info_rag = ""
-        if any(w in user_text.lower() for w in ["reglamento", "articulo", "ley", "historia", "fundacion", "torneo", "formato"]):
+        palabras_rag = [
+            "reglamento", "reglament", "articulo", "artículo", "ley", "historia",
+            "fundacion", "fundación", "fundó", "fundad", "formato", "reglas",
+            "normas", "torneo", "campeonato", "sancion", "sanción",
+            "como se juega", "participantes",
+        ]
+        if any(p in user_text.lower() for p in palabras_rag):
             info_rag = buscar_en_pdfs(user_text)
             if info_rag:
                 info_rag = f"\n[Información extraída de documentos oficiales/reglamentos]:\n{info_rag}\n"
 
-        # 5. Estadísticas locales
+        # 5. Estadísticas locales (racha del equipo, guardadas en SQLite)
         info_stats = ""
-        if any(w in user_text.lower() for w in ["racha", "estadistica", "rendimiento", "ultimos partidos"]):
-            palabras = user_text.split()
-            equipo_buscado = palabras[-1] if palabras else ""
+        palabras_stats = [
+            "racha", "estadistica", "estadística", "estadístic", "estadistic",
+            "rendimiento", "ultimos partidos", "últimos partidos", "como viene",
+            "en que forma", "en qué forma", "esta en forma", "está en forma",
+        ]
+        if any(p in user_text.lower() for p in palabras_stats):
+            equipo_buscado = _extraer_equipo(user_text)
             if equipo_buscado:
                 info_stats = f"\n{analizar_racha_equipo(equipo_buscado)}\n"
 
@@ -1320,7 +1891,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_audio))
 
-    print("BotTin  (Gemini + SQLite) con Champions League, Promiedos, RAG y Estadísticas activo... "
+    print("BotTin v5_2 (Gemini + SQLite) con Champions League, Promiedos, RAG y Estadísticas activo... "
           "Presioná Ctrl+C para detenerlo.")
     app.run_polling()
 
