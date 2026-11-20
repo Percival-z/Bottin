@@ -14,10 +14,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import requests
 from PIL import Image
 from pypdf import PdfReader
+from typing import Literal
+
+from pydantic import BaseModel, Field, ValidationError
 
 from google import genai
 
-from prompts import SYSTEM_INSTRUCTION
+from prompts import SYSTEM_INSTRUCTION, SISTEMA_ANALISIS
 
 # Cargar las variables de entorno desde el archivo .env
 load_dotenv()
@@ -40,6 +43,20 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 generation_config = {
     "temperature": 0.7,
 }
+
+# --- SALIDA ESTRUCTURADA (JSON validado con Pydantic) ---
+# Esquema del análisis de partido: Gemini debe devolver EXACTAMENTE este
+# objeto (response_format lo obliga) y Pydantic lo valida antes de que el
+# bot lo use para responder y lo guarde en SQLite.
+class AnalisisPartido(BaseModel):
+    """Análisis de un partido con salida estructurada."""
+    equipo_local: str = Field(description="Nombre del equipo local")
+    equipo_visita: str = Field(description="Nombre del equipo visitante")
+    prediccion: Literal["gana_local", "empate", "gana_visita"] = Field(
+        description="Pronóstico del resultado: gana_local, empate o gana_visita"
+    )
+    clave: str = Field(description="Factor clave del partido en una frase")
+    confianza: int = Field(ge=0, le=100, description="Nivel de certeza de 0 a 100")
 
 # --- CONFIGURACIÓN DE SQLITE (HISTORIAL PERSISTENTE) ---
 # Ruta absoluta: así la DB queda siempre en la misma carpeta del script,
@@ -70,6 +87,21 @@ def init_db():
             first_name TEXT,
             created_at TEXT,
             last_seen TEXT
+        )
+    ''')
+    # Análisis de partido con salida estructurada: una fila por análisis
+    # validado con Pydantic (el resultado del módulo avanzado)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS analisis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            consulta TEXT,
+            equipo_local TEXT,
+            equipo_visita TEXT,
+            prediccion TEXT,
+            clave TEXT,
+            confianza INTEGER,
+            timestamp TEXT
         )
     ''')
     conn.commit()
@@ -118,6 +150,25 @@ def save_interaction(chat_id: int, user_text: str, bot_reply: str):
             (chat_id, "model", bot_reply, ahora)
         )
         conn.commit()
+    finally:
+        conn.close()
+
+def guardar_analisis(chat_id: int, consulta: str, a: "AnalisisPartido") -> int:
+    """Guarda un análisis validado por Pydantic en la tabla `analisis`.
+    Devuelve el id de la fila insertada (para poder mostrarlo como evidencia)."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        cursor = conn.cursor()
+        ahora = datetime.now().isoformat()
+        cursor.execute(
+            """INSERT INTO analisis
+               (chat_id, consulta, equipo_local, equipo_visita, prediccion, clave, confianza, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, consulta, a.equipo_local, a.equipo_visita,
+             a.prediccion, a.clave, a.confianza, ahora),
+        )
+        conn.commit()
+        return cursor.lastrowid
     finally:
         conn.close()
 
@@ -1527,6 +1578,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Podés preguntarme por partidos de hoy (Champions, ligas europeas, selecciones o "
         "fútbol argentino), tablas de posiciones, estadísticas, reglamentos o enviarme "
         "imágenes o notas de voz. "
+        "También pedirme un análisis de partido, p. ej.: «analizá el partido River vs Boca». "
         "Guardo el historial de nuestra charla de forma local.\n\n"
         "**Comandos disponibles:**\n"
         "/start - Inicia la conversación con el bot\n"
@@ -1597,6 +1649,106 @@ def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str,
     )
     return pasos
 
+# --- MÓDULO AVANZADO: ANÁLISIS DE PARTIDO CON SALIDA ESTRUCTURADA ---
+
+def es_analisis(texto: str) -> bool:
+    """True si el usuario pide un análisis de partido («analizá el partido...»).
+    Así el pedido se engancha al módulo con salida estructurada en vez del
+    camino de texto libre."""
+    t = texto.lower()
+    return any(k in t for k in ("analiz", "análisis", "analisis"))
+
+async def analizar_partido(chat_id: int, user_text: str) -> str:
+    """Análisis de partido con SALIDA ESTRUCTURADA (criterio de la entrega):
+
+    1. Gemini devuelve un JSON que cumple el esquema `AnalisisPartido`
+       (response_format + schema lo obligan, no puede responder texto libre).
+    2. Pydantic VALIDA el objeto con `model_validate_json`: si el modelo se
+       sale del esquema, falla acá y se reintenta, en vez de guardar cualquiera.
+    3. El bot USA los campos validados para armar la respuesta.
+    4. Lo GUARDA en la tabla `analisis` de SQLite (evidencia visible con
+       `sqlite3 bottin_history.db "SELECT * FROM analisis;"`).
+    """
+    # Datos reales de contexto: partidos del día / forma reciente (misma
+    # fuente híbrida que el camino normal, para que el análisis no invente)
+    contexto_partidos = ""
+    try:
+        contexto_partidos = obtener_partidos_inteligente(user_text)
+    except Exception as e:
+        logger.warning(f"Análisis: sin datos de partidos ({e})")
+
+    # Contexto temporal exacto (mismo criterio que generar_respuesta)
+    dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    now = datetime.now()
+    ahora_formateada = f"{dias[now.weekday()]} {now.day} de {meses[now.month]} de {now.year} a las {now.strftime('%H:%M')}"
+
+    peticion = (
+        f"[Contexto del sistema: Hoy es {ahora_formateada}].\n"
+        f"{contexto_partidos}\n"
+        f"Consulta del usuario: {user_text}"
+    )
+
+    # 1. Consulta con salida estructurada: esquema forzado por la API.
+    #    (api_version v1beta es exigida por response_mime_type/response_format)
+    analisis: AnalisisPartido | None = None
+    ultimo_error: ValidationError | None = None
+    for intento in range(2):
+        interaccion = await client.aio.interactions.create(
+            api_version="v1beta",
+            model=GEMINI_MODEL,
+            system_instruction=SISTEMA_ANALISIS,
+            generation_config={"temperature": 0.4},
+            input=[{"type": "user_input",
+                    "content": [{"type": "text", "text": peticion}]}],
+            response_mime_type="application/json",
+            response_format={"mime_type": "application/json",
+                             "schema": AnalisisPartido.model_json_schema(),
+                             "type": "text"},
+            store=False,
+        )
+        # Defensa: por las dudas el modelo devuelve el JSON entre ```json
+        crudo = (interaccion.output_text or "").strip()
+        crudo = re.sub(r"^```(?:json)?\s*|\s*```$", "", crudo)
+
+        # 2. VALIDACIÓN Pydantic del objeto devuelto por el modelo
+        try:
+            analisis = AnalisisPartido.model_validate_json(crudo)
+            break
+        except ValidationError as e:
+            ultimo_error = e
+            logger.warning(f"⚠️ JSON fuera del esquema (intento {intento + 1}/2): {e}")
+            peticion += ("\n\nIMPORTANTE: tu JSON anterior no cumplía el esquema. "
+                         "Devolvé exactamente el objeto JSON con los campos del esquema.")
+
+    if analisis is None:
+        raise ValueError(f"El modelo no devolvió un JSON válido para AnalisisPartido: {ultimo_error}")
+
+    # 3. El bot USA el objeto validado (no el texto crudo) para responder
+    prediccion_texto = {
+        "gana_local": f"Gana {analisis.equipo_local}",
+        "empate": "Empate",
+        "gana_visita": f"Gana {analisis.equipo_visita}",
+    }[analisis.prediccion]
+    respuesta = (
+        "📊 *Análisis del partido*\n"
+        f"⚽ {analisis.equipo_local} vs {analisis.equipo_visita}\n"
+        f"🔮 Predicción: {prediccion_texto}\n"
+        f"🔑 Clave: {analisis.clave}\n"
+        f"📈 Confianza: {analisis.confianza}%"
+    )
+
+    # 4. GUARDAR: fila propia en SQLite + historial normal de la conversación
+    id_analisis = guardar_analisis(chat_id, user_text, analisis)
+    save_interaction(chat_id, user_text, respuesta)
+    logger.info(
+        f"🧾 Análisis estructurado #{id_analisis} guardado en SQLite | "
+        f"{analisis.equipo_local} vs {analisis.equipo_visita} | "
+        f"predicción: {analisis.prediccion} | confianza: {analisis.confianza}%"
+    )
+    return respuesta
+
 async def generar_respuesta(chat_id: int, user_text: str) -> str:
     """Arma el contexto (historial, partidos, RAG y estadísticas), consulta a
     Gemini y guarda la interacción en SQLite. Devuelve la respuesta del modelo.
@@ -1604,6 +1756,14 @@ async def generar_respuesta(chat_id: int, user_text: str) -> str:
     Es el camino común de las consultas: lo usan tanto los mensajes de texto
     como los de audio (que primero se transcriben).
     """
+    # 0. Análisis de partido → módulo de salida estructurada (JSON + Pydantic).
+    #    Se engancha acá para que también lo usen los audios transcritos.
+    #    (Si pide racha/estadísticas, se va al módulo de stats que ya existía)
+    es_stats = any(w in user_text.lower() for w in
+                   ("racha", "estadistica", "estadística", "rendimiento"))
+    if es_analisis(user_text) and not es_stats:
+        return await analizar_partido(chat_id, user_text)
+
     # 1. Recuperar el historial previo de SQLite (ventana acotada a MAX_HISTORY)
     historial = get_chat_history(chat_id)
 

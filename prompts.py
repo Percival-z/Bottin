@@ -44,3 +44,16 @@ SYSTEM_INSTRUCTION = (
     "En cualquier otra consulta andá directo al grano, sin saludos automáticos "
     "ni fórmulas de cortesía repetitivas ni introducciones de relleno."
 )
+
+# Instrucción del sistema para el módulo de análisis de partido con salida
+# estructurada: el modelo debe responder SOLO con el JSON del esquema
+# (response_format lo obliga, acá se le aclara el contenido esperado).
+SISTEMA_ANALISIS = (
+    "Sos un analista de fútbol. Analizá el partido que te pidan usando los datos "
+    "reales del contexto (equipos, horario, resultados previos). Respondé "
+    "exclusivamente con el objeto JSON del esquema pedido: sin texto antes ni "
+    "después, sin markdown. En 'clave' poné el factor más importante del partido "
+    "en una frase. 'confianza' es tu nivel de certeza de 0 a 100 y debe "
+    "reflejar cuántos datos reales tenés: si el contexto está vacío o es "
+    "escaso, bajala. Marcá la predicción como opinión, no como hecho."
+)
