@@ -1,0 +1,138 @@
+{
+  "descripcion": "Casos de evaluación del BotTin. El script es el propio bot.py: se envía cada entrada al bot tal como está escrita y se verifica la salida indicada en 'esperado'. Los casos marcados como 'manual' se prueban enviándolos directamente por Telegram (foto o nota de voz).",
+  "total": 16,
+  "casos": [
+    {
+      "n": 1,
+      "categoria": "Comando",
+      "entrada": "/start",
+      "tipo": "texto",
+      "demuestra": "Saludo con la personalidad del bot",
+      "esperado": "Saludo breve que presenta al bot y sugiere qué preguntar"
+    },
+    {
+      "n": 2,
+      "categoria": "Comando",
+      "entrada": "/help",
+      "tipo": "texto",
+      "demuestra": "Lista de comandos y capacidades del bot",
+      "esperado": "Menciona los comandos /start, /help y /olvidar y qué puede hacer"
+    },
+    {
+      "n": 3,
+      "categoria": "Función propia 1 · Live Scores",
+      "entrada": "¿Qué partidos hay hoy?",
+      "tipo": "texto",
+      "demuestra": "Consulta a API-Football y muestra los partidos del día",
+      "esperado": "Lista partidos con horarios y/o marcadores, agrupados por liga"
+    },
+    {
+      "n": 4,
+      "categoria": "Función propia 1 · Tabla de posiciones",
+      "entrada": "¿Cómo está la tabla de posiciones de la Liga?",
+      "tipo": "texto",
+      "demuestra": "Scraping de Promiedos para armar la tabla de posiciones",
+      "esperado": "Muestra posiciones de la Liga Profesional con puntos"
+    },
+    {
+      "n": 5,
+      "categoria": "Función propia 2 · Estadísticas",
+      "entrada": "¿Cómo viene Boca?",
+      "tipo": "texto",
+      "demuestra": "Racha del equipo leída de la base de datos SQLite",
+      "esperado": "Informa victorias/empates/derrotas recientes y goles a favor y en contra"
+    },
+    {
+      "n": 6,
+      "categoria": "RAG",
+      "entrada": "¿Cuántos equipos tiene y cómo es el formato del torneo?",
+      "tipo": "texto",
+      "demuestra": "Recuperación del reglamento oficial de la AFA (formato del torneo)",
+      "esperado": "Dice 30 equipos, dos zonas de 15, fase de zonas y playoffs (dato solo en el PDF)"
+    },
+    {
+      "n": 7,
+      "categoria": "RAG",
+      "entrada": "¿Qué dice el reglamento sobre la duración del partido?",
+      "tipo": "texto",
+      "demuestra": "Recuperación del reglamento de la AFA (duración y desempates)",
+      "esperado": "Menciona los 90 minutos reglamentarios, tiempo suplementario y penales"
+    },
+    {
+      "n": 8,
+      "categoria": "RAG",
+      "entrada": "¿Cómo se juega la Copa Libertadores?",
+      "tipo": "texto",
+      "demuestra": "Recuperación del PDF del formato de la Copa Libertadores",
+      "esperado": "Describe el formato de la Copa Libertadores a partir del documento"
+    },
+    {
+      "n": 9,
+      "categoria": "Análisis estructurado",
+      "entrada": "Analizá el partido Boca vs River",
+      "tipo": "texto",
+      "demuestra": "Salida estructurada: JSON validado con Pydantic que el bot usa y guarda",
+      "esperado": "Responde con equipos, predicción, clave y confianza; se guarda en la tabla analisis de SQLite"
+    },
+    {
+      "n": 10,
+      "categoria": "Memoria",
+      "entrada": "Soy hincha de River",
+      "tipo": "texto",
+      "demuestra": "Guarda el dato del usuario en el historial",
+      "esperado": "Responde reconociendo el dato (primer mensaje de la secuencia de memoria)"
+    },
+    {
+      "n": 11,
+      "categoria": "Memoria",
+      "entrada": "¿De qué equipo soy hincha?",
+      "tipo": "texto",
+      "demuestra": "Memoria: la respuesta usa el dato del mensaje anterior",
+      "esperado": "Dice River (requiere haber enviado antes el caso 10)",
+      "requiere": 10
+    },
+    {
+      "n": 12,
+      "categoria": "Multimodalidad · Foto",
+      "entrada": "Foto o captura (p. ej. una tabla de posiciones) con el texto: ¿Qué ves en esta imagen?",
+      "tipo": "foto",
+      "manual": true,
+      "demuestra": "Interpretación de imágenes con el modelo multimodal",
+      "esperado": "Describe y explica el contenido de la imagen enviada"
+    },
+    {
+      "n": 13,
+      "categoria": "Multimodalidad · Nota de voz",
+      "entrada": "Nota de voz diciendo: ¿Qué partidos hay hoy?",
+      "tipo": "audio",
+      "manual": true,
+      "demuestra": "Transcripción de audio con Gemini y respuesta por el camino de texto",
+      "esperado": "Transcribe el audio y responde con los partidos del día"
+    },
+    {
+      "n": 14,
+      "categoria": "Honestidad",
+      "entrada": "¿Cuánto cuesta una entrada al Monumental?",
+      "tipo": "texto",
+      "demuestra": "No inventa datos que no puede conocer con certeza",
+      "esperado": "Aclara que no tiene ese dato en lugar de inventar un precio"
+    },
+    {
+      "n": 15,
+      "categoria": "Alcance",
+      "entrada": "¿Qué me recomiendas para cenar hoy?",
+      "tipo": "texto",
+      "demuestra": "Se mantiene en su alcance (fútbol) y redirige con amabilidad",
+      "esperado": "Declina amablemente y redirige la conversación hacia el fútbol"
+    },
+    {
+      "n": 16,
+      "categoria": "Comando",
+      "entrada": "/olvidar",
+      "tipo": "texto",
+      "manual": true,
+      "demuestra": "Borra el historial del usuario de la base de datos (ejecutar al final)",
+      "esperado": "Confirma cuántos mensajes borró y ofrece empezar de cero"
+    }
+  ]
+}
