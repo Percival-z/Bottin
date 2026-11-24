@@ -49,11 +49,15 @@ SYSTEM_INSTRUCTION = (
 # estructurada: el modelo debe responder SOLO con el JSON del esquema
 # (response_format lo obliga, acá se le aclara el contenido esperado).
 SISTEMA_ANALISIS = (
-    "Sos un analista de fútbol. Analizá el partido que te pidan usando los datos "
-    "reales del contexto (equipos, horario, resultados previos). Respondé "
+    "Sos un analista de fútbol. Analizá el partido que te pidan. Usá los datos "
+    "reales del contexto si los hay (equipos, horario, resultados previos); "
+    "cuando falten, apoyate en tu conocimiento general de los equipos "
+    "(jerarquía, historial del enfrentamiento) sin inventar cifras. Respondé "
     "exclusivamente con el objeto JSON del esquema pedido: sin texto antes ni "
     "después, sin markdown. En 'clave' poné el factor más importante del partido "
-    "en una frase. 'confianza' es tu nivel de certeza de 0 a 100 y debe "
-    "reflejar cuántos datos reales tenés: si el contexto está vacío o es "
-    "escaso, bajala. Marcá la predicción como opinión, no como hecho."
+    "en una frase. 'confianza' es la probabilidad de 0 a 100 de que se cumpla "
+    "tu predicción: un pronóstico razonable nunca vale 0 (si predecís empate, "
+    "la probabilidad de empate jamás es 0), y sin datos del contexto debe "
+    "quedar en un rango moderado de 40 a 70. Marcá la predicción como opinión, "
+    "no como hecho."
 )

@@ -1,0 +1,241 @@
+# Guía: BotTin 24/7 en Oracle Cloud Always Free (sin cambios de código)
+
+Bot de Telegram con polling, VM gratis, disco persistente (SQLite se salva).
+Compatible con python-telegram-bot 22.8 y requirements.txt actual.
+
+---
+
+## Fase 0 — Previos (10 min)
+
+1. **Cuenta en Oracle Cloud**: andá a `oracle.com/cloud/free` → *Start for free*.
+   Pide **tarjeta de crédito/débito** para verificar identidad (no cobra nada si
+   solo usás recursos Always Free). Verificá email y elegí región.
+
+2. **Región recomendada**: `sa-east-1` (São Paulo) por latencia con Argentina.
+   Si en esa región no hay disponibilidad de VMs, usá `us-ashburn-1` o
+   `us-phoenix-1`.
+
+3. **Tu código ya está listo para subir**: remote `github.com/Percival-z/Bottin`.
+   Si el repo es **privado**, más adelante necesitás un Personal Access Token
+   (PAT) para clonar/pull, o subir todo por `scp`.
+
+---
+
+## Fase 1 — Crear la VM
+
+4. En el panel: **Menu → Compute → Instances → Create instance**.
+
+5. **Imagen (Boot volume)**: Ubuntu 22.04 o 24.04 (cualquiera; Ubuntu es lo
+   más cómodo).
+
+6. **Shape**: *Change shape* →
+   - **`VM.Standard.E2.1.Micro`** (AMD, 1 GB RAM): siempre gratis, alcanza para
+     este bot.
+   - **`VM.Standard.A1.Flex`** con 1 OCPU / 4-6 GB RAM: **mejor opción si está
+     disponible** (el plan Always Free te da hasta 4 OCPU / 24 GB de Ampere en
+     total; a veces está en lista de espera por capacidad).
+
+7. **Clave SSH**: *Edit → Generate key pair* → **descargá el `.key`/`.pem`
+   ahora, solo se descarga una vez**. (La opción "SSH keys" del formulario
+   también sirve si ya tenés clave tuya.)
+
+8. **Red**: usá el asistente *VCN with internet access* (crea VCN, subnet
+   pública y security list automáticamente). En **Security List → Add ingress
+   rules** agregá **una sola regla**: Protocol **TCP**, puerto **22**,
+   Source `Tu IP/32` (o `0.0.0.0/0` si tu IP es dinámica, aunque es menos
+   seguro).
+
+   ⚠️ **No necesitás abrir ningún otro puerto.** Con polling el bot *sale* a
+   preguntar a Telegram; nada entra a la VM. Esa es justamente la ventaja sobre
+   webhook.
+
+9. Dejá la IP pública asignada automática → **Create**. Esperá ~1 minuto a que
+   esté *Running*.
+
+---
+
+## Fase 2 — Conectar y preparar
+
+10. Desde tu terminal:
+
+    ```bash
+    chmod 600 ~/Descargas/tu-clave.key
+    ssh -i ~/Descargas/tu-clave.key ubuntu@IP_PUBLICA
+    ```
+
+11. Actualizar e instalar lo mínimo:
+
+    ```bash
+    sudo apt update && sudo apt install -y python3-venv git
+    ```
+
+12. **Zona horaria** (clave para que "hoy" en el bot sea el de Argentina; si
+    queda en UTC, de 21:00 a medianoche pediría a API-Football la fecha
+    equivocada):
+
+    ```bash
+    sudo timedatectl set-timezone America/Argentina/Buenos_Aires
+    ```
+
+---
+
+## Fase 3 — Subir el código y la configuración
+
+13. Clonar el repo:
+
+    ```bash
+    git clone https://github.com/Percival-z/Bottin.git
+    cd Bottin
+    ```
+
+    *(Si es privado: `git clone https://TU-USUARIO:TU-PAT@github.com/Percival-z/Bottin.git`
+    — el PAT lo generás en GitHub → Settings → Developer settings → Personal
+    access tokens.)*
+
+14. **Subir el `.env` desde tu máquina** (nunca va en git, lo tenés ignorado):
+
+    ```bash
+    # en tu máquina, desde el proyecto:
+    ssh -i ~/Descargas/tu-clave.key ubuntu@IP_PUBLICA "mkdir -p ~/Bottin"
+    scp -i ~/Descargas/tu-clave.key .env ubuntu@IP_PUBLICA:~/Bottin/
+    ```
+
+15. **(Recomendado) Copiar tu DB actual** para no perder historial,
+    `team_matches` y `analisis`:
+
+    ```bash
+    scp -i ~/Descargas/tu-clave.key bottin_history.db ubuntu@IP_PUBLICA:~/Bottin/
+    ```
+
+16. Crear el entorno e instalar dependencias (los pins de `requirements.txt`
+    son todos compatibles con Python 3.12 de Ubuntu):
+
+    ```bash
+    python3 -m venv .venv
+    .venv/bin/pip install -r requirements.txt
+    ```
+
+---
+
+## Fase 4 — Probar en vivo
+
+17. Arrancá a mano:
+
+    ```bash
+    .venv/bin/python bot.py
+    ```
+
+    Deberías ver `BotTin (Gemini + SQLite) ... activo...` y **probar desde tu
+    Telegram** (mandale cualquier consulta). Si anduvo, `Ctrl+C`.
+
+---
+
+## Fase 5 — Dejarlo 24/7 (systemd)
+
+18. Creá el servicio:
+
+    ```bash
+    sudo nano /etc/systemd/system/bottin.service
+    ```
+
+    ```ini
+    [Unit]
+    Description=BotTin Telegram
+    After=network.target
+
+    [Service]
+    User=ubuntu
+    WorkingDirectory=/home/ubuntu/Bottin
+    ExecStart=/home/ubuntu/Bottin/.venv/bin/python bot.py
+    Restart=always
+    RestartSec=5
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+
+19. Activalo:
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable bottin     # arranca solo al reiniciar la VM
+    sudo systemctl start bottin
+    ```
+
+20. Verificar:
+
+    ```bash
+    systemctl status bottin          # active (running)
+    journalctl -u bottin -f          # los logs en vivo, igual que tu terminal
+    ```
+
+    Con esto el bot sobrevive reinicios de la VM y caídas (si Python se muere,
+    systemd lo relanza en 5 s).
+
+---
+
+## Fase 6 — Mantenimiento
+
+21. **Actualizar código** tras un commit:
+
+    ```bash
+    cd ~/Bottin && git pull && sudo systemctl restart bottin
+    ```
+
+    *(Si el repo es privado: `git config --global credential.helper store` y la
+    primera vez te pide usuario + PAT.)*
+
+22. **Backup de la DB**: la DB vive en el disco de arranque de la VM y
+    **persiste mientras la instancia exista** (Oracle no la borra al reiniciar;
+    solo si borrás la VM). Para más seguridad, un `scp` periódico de
+    `bottin_history.db` a tu máquina, o un cron en la VM que la copie.
+
+23. **Logs/gastos**: Oracle te cobra solo si te pasás de lo Always Free (2 VMs
+    AMD micro *o* hasta 4 OCPU/24 GB Ampere, 200 GB de volumen, etc.). Podés
+    poner una alarma de presupuesto en *Governance & Administration → Budgets &
+    Alarms* para que te avise si algo se escapa.
+
+---
+
+## Notas que te van a ahorrar dolores de cabeza
+
+- **Ningún puerto abierto salvo SSH** = superficie de ataque mínima y no
+  toques firewall para Telegram.
+
+- **`timedatectl` en Fase 2, paso 12**: es el único "cambio de config" que
+  afecta al código sin tocar código — el bot usa `datetime.now()` para armar la
+  fecha que le manda a API-Football.
+
+- **No crees recursos extra** (IPs reservadas, block volumes adicionales, load
+  balancers): esos sí son pagos fuera del free tier.
+
+- Oracle puede reclamar instancias Always Free que estén **muertas mucho
+  tiempo**; tu bot corriendo 24/7 con polling constante cuenta como uso, así
+  que quedate tranquilo mientras esté el servicio activo.
+
+- **Reinicio de cuota de API-Football**: a medianoche (hora argentina ya con el
+  timezone bien puesto) vuelve a 100 requests.
+
+- **Webhook vs polling**: con polling NO necesitás HTTPS ni abrir puertos ni
+  `run_webhook`. Telegram lo que hace es que tu bot llama a la API cada pocos
+  segundos. Si algún día querés webhook, sería cambiar `run_polling()` por
+  `run_webhook(...)` (necesita HTTPS + puerto 443/80/8443/8888/8080) y
+  `pip install "python-telegram-bot[webhooks]"`.
+
+---
+
+## Orden rápido (checklist)
+
+- [ ] Cuenta Oracle + tarjeta verificada
+- [ ] VM Ubuntu creada (micro o A1), clave SSH descargada
+- [ ] Puerto 22 abierto en security list
+- [ ] SSH conectado
+- [ ] Timezone AR puesto
+- [ ] Repo clonado
+- [ ] `.env` subido
+- [ ] `bottin_history.db` copiada
+- [ ] venv + requirements instalados
+- [ ] Prueba manual con `python bot.py`
+- [ ] Servicio systemd creado y activo
+- [ ] Verificado con `systemctl status` + prueba en Telegram
+- [ ] `git pull` + `systemctl restart bottin` como flujo de actualización

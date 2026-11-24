@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -829,7 +830,7 @@ def obtener_partidos_promiedos() -> str:
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
-            print(f"❌ Promiedos respondió HTTP {response.status_code}")
+            logger.warning(f"Promiedos respondió HTTP {response.status_code}")
             return ""
             
         match = re.search(
@@ -837,7 +838,7 @@ def obtener_partidos_promiedos() -> str:
             response.text, re.S
         )
         if not match:
-            print("❌ No se encontró __NEXT_DATA__ en Promiedos (volvió a cambiar la web).")
+            logger.warning("No se encontró __NEXT_DATA__ en Promiedos (volvió a cambiar la web).")
             return ""
             
         data = json.loads(match.group(1))
@@ -868,10 +869,10 @@ def obtener_partidos_promiedos() -> str:
                 etiqueta = f"{nombre_liga} - {ronda}" if ronda else nombre_liga
                 resumen.append(f"- [{etiqueta}] {local} vs {visita} -> {marcador}")
                 
-        print(f"🇦🇷 Promiedos: {len(resumen)} partidos del día leídos del JSON de la web.")
+        logger.info(f"🇦🇷 Promiedos: {len(resumen)} partidos del día leídos del JSON de la web.")
         return "\n".join(resumen[:15]) if resumen else ""
     except Exception as e:
-        print(f"❌ Error leyendo Promiedos: {e}")
+        logger.error(f"Error leyendo Promiedos: {e}")
         return ""
 
 # --- FUENTE ESPN (sin clave): jornadas anteriores y respaldo de hoy ---
@@ -1024,7 +1025,7 @@ def _pedir_espn(slug: str, fecha: datetime) -> list[dict]:
             return []
         return response.json().get("events", [])
     except Exception as e:
-        print(f"❌ Error consultando ESPN ({slug}): {e}")
+        logger.error(f"Error consultando ESPN ({slug}): {e}")
         return []
 
 def _formatear_espn(events: list[dict], nombre_liga: str) -> list[str]:
@@ -1531,25 +1532,67 @@ _STOPWORDS_RAG = {
     "partido", "partidos", "equipo", "equipos", "jugaron", "jugadores",
 }
 
+# Mapa de sinónimos: la consulta usa una palabra y los documentos usan otras.
+# Sin esto, "formato" solo pega en el PDF que lleva la palabra en el título
+# (el de Libertadores) y el reglamento de la AFA, que nunca la usa, queda afuera.
+_SINONIMOS_RAG = {
+    "formato": ["apertura", "clausura", "zona", "zonas", "interzonal",
+                "fase", "fases", "fixture", "sistema"],
+    "duracion": ["minutos", "tiempos"],
+    "reglamento": ["articulo", "articulos"],
+    "torneo": ["campeonato"],
+    "campeonato": ["torneo"],
+}
+
 def buscar_en_pdfs(query: str) -> str:
     """Busca los fragmentos más relevantes de los documentos locales para la
-    consulta: puntúa cada trozo según cuántas palabras clave repite (con tope por
-    palabra, para que una repetida como 'copa' no domine) y cuántas distintas
-    aparecen, y devuelve los 3 mejores."""
-    claves = [c for c in (_normalizar_nombre(p) for p in query.split())
-              if len(c) > 3 and c not in _STOPWORDS_RAG]
-    if not claves:
+    consulta.
+
+    El ranking combina tres cosas:
+    1. Sinónimos: expande cada palabra clave con las que usan los documentos
+       (ver _SINONIMOS_RAG), pesando la palabra exacta del usuario el doble.
+    2. IDF: una palabra que aparece en casi todos los fragmentos ("torneo")
+       aporta poco; una rara ("interzonal") aporta mucho. Así el título del
+       PDF de Libertadores no domina por repetir "formato" y "torneo".
+    3. Bonus por variedad: cuanto más claves distintas toca el fragmento,
+       mejor (no basta con repetir una sola).
+
+    Devuelve los 3 mejores fragmentos con su fuente y número de página.
+    """
+    claves_originales = [c for c in (_normalizar_nombre(p) for p in query.split())
+                         if len(c) > 3 and c not in _STOPWORDS_RAG]
+    if not claves_originales:
         return ""
-    candidatos = []
+    claves: dict[str, float] = {}
+    for clave in claves_originales:
+        claves[clave] = 2.0                      # la palabra exacta vale doble
+        for sinonimo in _SINONIMOS_RAG.get(clave, []):
+            claves.setdefault(sinonimo, 1.0)     # los sinónimos, peso simple
+
+    # Paso 1: trocear todo y armar el índice de frecuencia (IDF)
+    fragmentos: list[tuple[str, int, str, str]] = []   # (archivo, pág, texto, normalizado)
     for archivo, pagina, texto in _documentos_cargados():
         for trozo in _trocear(texto):
-            normalizado = _normalizar_nombre(trozo)
-            conteos = [(clave, normalizado.count(clave)) for clave in claves]
-            presentes = [n for _, n in conteos if n]
-            if not presentes:
-                continue
-            puntaje = sum(min(n, 3) for n in presentes) + 2 * len(presentes)
-            candidatos.append((puntaje, archivo, pagina, trozo))
+            fragmentos.append((archivo, pagina, trozo, _normalizar_nombre(trozo)))
+    if not fragmentos:
+        return ""
+    df = {clave: sum(1 for *_, norm in fragmentos if clave in norm)
+          for clave in claves}
+    total = len(fragmentos)
+    idf = {clave: math.log(1 + total / (1 + df[clave])) for clave in claves}
+
+    # Paso 2: puntuar cada fragmento
+    candidatos = []
+    for archivo, pagina, trozo, norm in fragmentos:
+        puntaje = 0.0
+        presentes = 0
+        for clave, peso in claves.items():
+            conteo = norm.count(clave)
+            if conteo:
+                puntaje += peso * min(conteo, 3) * idf[clave]
+                presentes += 1
+        if presentes:
+            candidatos.append((puntaje + 2 * presentes, archivo, pagina, trozo))
     if not candidatos:
         return ""
     candidatos.sort(key=lambda c: (-c[0], len(c[3])))
@@ -1784,6 +1827,14 @@ async def generar_respuesta(chat_id: int, user_text: str) -> str:
 
         # 3. Consulta inteligente de partidos (Incluye Champions League, Promiedos y ESPN)
         info_partidos = ""
+        # Una consulta de reglamento/normas no debe traer también los partidos
+        # del día: "¿qué dice el reglamento sobre la duración del partido?"
+        # terminaba listando los encuentros de la Champions en la respuesta.
+        es_consulta_reglamento = any(p in user_text.lower() for p in (
+            "reglamento", "reglament", "articulo", "artículo", "ley",
+            "normas", "reglas", "duracion", "duración", "sancion", "sanción",
+            "como se juega", "formato",
+        ))
         palabras_clave_partidos = [
             "partido", "partidos", "juega", "hoy", "resultado", "resultados", "fecha",
             "tabla", "equipo", "equipos", "vs", "champions", "river", "boca",
@@ -1795,7 +1846,8 @@ async def generar_respuesta(chat_id: int, user_text: str) -> str:
             "copa america", "eurocopa", "eliminatoria", "eliminatorias",
             "amistoso", "amistosos", "nations league", "liga de naciones",
         ]
-        if any(palabra in user_text.lower() for palabra in palabras_clave_partidos) and not info_tabla:
+        if (any(palabra in user_text.lower() for palabra in palabras_clave_partidos)
+                and not info_tabla and not es_consulta_reglamento):
             datos_hibridos = obtener_partidos_inteligente(user_text)
             if datos_hibridos:
                 info_partidos = f"\n{datos_hibridos}\n"
@@ -1806,7 +1858,7 @@ async def generar_respuesta(chat_id: int, user_text: str) -> str:
             "reglamento", "reglament", "articulo", "artículo", "ley", "historia",
             "fundacion", "fundación", "fundó", "fundad", "formato", "reglas",
             "normas", "torneo", "campeonato", "sancion", "sanción",
-            "como se juega", "participantes",
+            "como se juega", "participantes", "duracion", "duración", "minutos",
         ]
         if any(p in user_text.lower() for p in palabras_rag):
             info_rag = buscar_en_pdfs(user_text)
@@ -1817,7 +1869,8 @@ async def generar_respuesta(chat_id: int, user_text: str) -> str:
         info_stats = ""
         palabras_stats = [
             "racha", "estadistica", "estadística", "estadístic", "estadistic",
-            "rendimiento", "ultimos partidos", "últimos partidos", "como viene",
+            "rendimiento", "ultimos partidos", "últimos partidos",
+            "como viene", "cómo viene",
             "en que forma", "en qué forma", "esta en forma", "está en forma",
         ]
         if any(p in user_text.lower() for p in palabras_stats):
