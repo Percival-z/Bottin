@@ -1610,14 +1610,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.effective_chat.id, usuario.id, usuario.username, usuario.first_name
     )
     await update.message.reply_text(
-        f"¡Hola, {usuario.first_name}! ⚽ Soy BotTin , tu asistente con Champions League, "
+        f"¡Hola, {usuario.first_name}! ⚽ Soy BotTin, tu asistente con Champions League, "
         f"Promiedos, estadísticas y RAG. Escribí /help para más info."
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Responde al comando /help mostrando la lista de comandos disponibles."""
     await update.message.reply_text(
-        "🤖 **BotTin  (Gemini + SQLite)**\n"
+        "🤖 **BotTin (Gemini + SQLite)**\n"
         "Podés preguntarme por partidos de hoy (Champions, ligas europeas, selecciones o "
         "fútbol argentino), tablas de posiciones, estadísticas, reglamentos o enviarme "
         "imágenes o notas de voz. "
