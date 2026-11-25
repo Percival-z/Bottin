@@ -1542,7 +1542,35 @@ _SINONIMOS_RAG = {
     "reglamento": ["articulo", "articulos"],
     "torneo": ["campeonato"],
     "campeonato": ["torneo"],
+    # "fundó" se normaliza a "fundo", que no es subcadena de "fundado" ni de
+    # "fundación": sin esto, "¿cuándo se fundó River?" no pegaba en la página 1
+    # de su historia (donde está la fecha) y se iba a fragmentos al azar.
+    "fundo": ["fundado", "fundada", "fundacion", "fundadores", "fundaron"],
 }
+
+# Tokens de club por archivo de historia (derivados del nombre: "historia_club_
+# san_lorenzo.pdf" → {"lorenzo"}). Si la consulta nombra al club, sus fragmentos
+# ganan un bonus: sin esto, "¿cuándo se fundó Racing?" traía primero una página
+# de Estudiantes, que cita a Racing como rival y también habla de fundación.
+# Solo aplica a historia_club_*: "formato" está en el nombre del PDF de la
+# Libertadores y no debe ganarle al reglamento de la AFA.
+_BONUS_CLUB = 18.0
+_CLUB_POR_ARCHIVO: dict[str, set[str]] = {}
+
+
+def _tokens_club(archivo: str) -> set[str]:
+    """Tokens con más de 3 letras del nombre del archivo de historia, sin las
+    palabras genéricas ("historia", "club", "pdf")."""
+    if archivo not in _CLUB_POR_ARCHIVO:
+        if archivo.startswith("historia_club_"):
+            genericos = {"historia", "club", "pdf"}
+            _CLUB_POR_ARCHIVO[archivo] = {
+                t for t in _normalizar_nombre(archivo).split()
+                if len(t) > 3 and t not in genericos
+            }
+        else:
+            _CLUB_POR_ARCHIVO[archivo] = set()
+    return _CLUB_POR_ARCHIVO[archivo]
 
 def buscar_en_pdfs(query: str) -> str:
     """Busca los fragmentos más relevantes de los documentos locales para la
@@ -1592,6 +1620,9 @@ def buscar_en_pdfs(query: str) -> str:
                 puntaje += peso * min(conteo, 3) * idf[clave]
                 presentes += 1
         if presentes:
+            # Bonus: la consulta nombra al club del que habla este documento
+            if any(c in claves_originales for c in _tokens_club(archivo)):
+                puntaje += _BONUS_CLUB
             candidatos.append((puntaje + 2 * presentes, archivo, pagina, trozo))
     if not candidatos:
         return ""
