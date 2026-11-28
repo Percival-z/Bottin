@@ -1,0 +1,4 @@
+# Dependencias de desarrollo: solo para la suite de tests.
+# Uso: .venv/bin/python -m pip install -r requirements-dev.txt
+pytest==9.2.0
+pytest-xdist==3.8.0
