@@ -298,7 +298,13 @@ def _consultar_historial(nombre: str) -> tuple[str | None, list[tuple]]:
     Devuelve (equipo elegido, filas), donde las filas son
     (team, opponent, result, goals_for, goals_against, date) ordenadas de la más
     reciente a la más vieja. Si el nombre pega con varios equipos, se queda con
-    el que más partidos tiene ("river" → "River Plate")."""
+    el que más partidos tiene ("river" → "River Plate").
+
+    La comparación se hace en Python con _normalizar_nombre y no con LIKE:
+    LIKE no distingue acentos, así que el patrón "velez" (normalizado desde
+    "Vélez") no llegaba a coincidir con el "Vélez Sarsfield" guardado en la
+    base y ningún equipo con tildes se podía buscar.
+    """
     patron = _normalizar_nombre(nombre).replace("%", "").replace("_", "")
     if not patron:
         return None, []
@@ -306,16 +312,16 @@ def _consultar_historial(nombre: str) -> tuple[str | None, list[tuple]]:
     try:
         filas = conn.execute(
             """SELECT team, opponent, result, goals_for, goals_against, date
-               FROM team_matches WHERE team LIKE ? ORDER BY date DESC""",
-            (f"%{patron}%",),
+               FROM team_matches ORDER BY date DESC""",
         ).fetchall()
     finally:
         conn.close()
-    if not filas:
-        return None, []
     por_equipo: dict[str, list[tuple]] = {}
     for fila in filas:
-        por_equipo.setdefault(fila[0], []).append(fila)
+        if patron in _normalizar_nombre(fila[0]):
+            por_equipo.setdefault(fila[0], []).append(fila)
+    if not por_equipo:
+        return None, []
     elegido = max(por_equipo, key=lambda e: (len(por_equipo[e]), -len(e)))
     return elegido, por_equipo[elegido]
 
@@ -684,6 +690,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
     level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- ESTRATEGIA HÍBRIDA DE DATOS (API-FOOTBALL + CHAMPIONS + PROMIEDOS) ---
